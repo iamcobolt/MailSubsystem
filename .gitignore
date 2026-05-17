@@ -1,0 +1,57 @@
+# Environment variables (sensitive - contains passwords and API keys)
+.env
+.env.local
+.env.*.local
+
+# Rust build artifacts
+target/
+
+# Cargo.lock is committed for reproducible binary builds.
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+.claude/
+.codex/
+.codex
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Python helper artifacts
+__pycache__/
+*.pyc
+
+# Database config (may contain passwords)
+database.toml
+accounts.toml
+
+# Session/temporary SQL files
+*.session.sql
+
+
+# Compiled binaries (if any are committed, adjust this)
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Remove cursor Plans
+*PLAN.md
+
+# Remove OpenAi Specifications
+*_SPEC.md
+
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc
+AGENTS.md
+CLAUDE.md

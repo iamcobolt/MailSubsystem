@@ -1,0 +1,47 @@
+[package]
+name = "mailsubsystem-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first AI email automation for IMAP mailboxes: sync, classify, detect phishing, and file messages with LLM agents."
+license = "AGPL-3.0-only"
+repository = "https://github.com/iamcobolt/MailSubsystem"
+homepage = "https://github.com/iamcobolt/MailSubsystem"
+readme = "README.md"
+keywords = ["email", "imap", "llm", "inbox-zero", "automation"]
+
+[[bin]]
+name = "mailsubsystem"
+path = "src/main.rs"
+
+[dependencies]
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
+futures-util = "0.3"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dotenvy = "0.15"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "chrono", "json"] }
+mailparse = "0.16"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "1"
+imap-proto = "0.16"
+env_logger = "0.11"
+log = "0.4"
+regex = "1"
+reqwest = { version = "0.13", features = ["json"] }
+rig = { package = "rig-core", version = "0.37", default-features = false, features = ["native-tls"] }
+async-trait = "0.1"
+pgvector = { version = "0.4", features = ["sqlx"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+percent-encoding = "2"
+ratatui = "0.30"
+crossterm = "0.29"
+tokio-tungstenite = "0.29"
