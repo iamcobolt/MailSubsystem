@@ -4,10 +4,29 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      time: "10:00"
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
     open-pull-requests-limit: 5
     labels:
       - dependencies
       - rust
+    commit-message:
+      prefix: chore
+      include: scope
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:30"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - security
     commit-message:
       prefix: chore
       include: scope

@@ -525,7 +525,7 @@ impl ImapClient {
         .await
     }
 
-    /// Raw UID FETCH envelopes: fetch BODY.PEEK[HEADER], parse headers to FetchEnvelopeResult. Returns (MailboxState, envelopes).
+    /// Raw UID FETCH envelopes: fetch `BODY.PEEK[HEADER]`, parse headers to FetchEnvelopeResult. Returns (MailboxState, envelopes).
     pub async fn raw_uid_fetch_envelopes(
         &self,
         mailbox_name: &str,

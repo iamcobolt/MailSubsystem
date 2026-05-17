@@ -224,10 +224,7 @@ pub async fn run_sync_for_account(account: &AccountConfig) -> anyhow::Result<()>
                         still_without.push((uid, env));
                     }
                 }
-                envelopes = with_mid
-                    .into_iter()
-                    .chain(still_without.into_iter())
-                    .collect();
+                envelopes = with_mid.into_iter().chain(still_without).collect();
             }
 
             let payload_array: Vec<serde_json::Value> = envelopes
@@ -1277,10 +1274,7 @@ pub async fn run_sync_window(days: Option<i64>, full: bool) -> anyhow::Result<()
                     still_without.push((uid, env));
                 }
             }
-            envelopes = with_mid
-                .into_iter()
-                .chain(still_without.into_iter())
-                .collect();
+            envelopes = with_mid.into_iter().chain(still_without).collect();
         }
 
         let payload_array: Vec<serde_json::Value> = envelopes

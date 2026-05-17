@@ -5,17 +5,27 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: "17 9 * * 1"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Show Rust toolchain
         run: rustup show
@@ -32,12 +42,18 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items
+
   supply-chain-checks:
     name: Supply-chain checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
