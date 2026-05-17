@@ -1,0 +1,50 @@
+name: Bug report
+description: Report reproducible behavior using redacted or synthetic data.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include real mailbox contents, credentials, private logs, or provider keys.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Use synthetic or redacted data only.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Could this move, expose, lose, or misclassify email?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, MailSubsystem commit/version, IMAP provider shape, database mode, and LLM provider path.
+    validations:
+      required: true
+  - type: checkboxes
+    id: data-safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I used synthetic, anonymized, or redacted data.
+          required: true
+        - label: I did not include secrets, mailbox exports, private logs, or raw private email.
+          required: true

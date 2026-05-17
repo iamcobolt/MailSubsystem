@@ -1,0 +1,33 @@
+name: Design or feature proposal
+description: Propose a change to behavior, architecture, agents, or operator workflows.
+title: "[Proposal]: "
+labels: ["proposal", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the intended behavior and where it fits.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and privacy impact
+      description: Call out mailbox mutation, raw email exposure, local API exposure, provider data sharing, and cost implications.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What simpler or safer options did you consider?
+    validations:
+      required: false
