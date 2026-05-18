@@ -19,6 +19,9 @@ pub trait EmbeddingProvider: Send + Sync {
     /// The model identifier (e.g. "gemini-embedding-001", "snowflake-arctic-embed-l-v2.0-bf16").
     fn model_name(&self) -> &str;
 
+    /// Whether this provider uses the local OpenAI-compatible endpoint.
+    fn is_local(&self) -> bool;
+
     /// Embed multiple texts in one batch (optional optimization).
     /// Default implementation calls embed() sequentially.
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -148,6 +151,10 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
         &self.model
     }
 
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for t in texts {
@@ -267,6 +274,10 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
     fn model_name(&self) -> &str {
         &self.model
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,8 +306,15 @@ impl EmbeddingProviderChoice {
     }
 }
 
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn has_gemini_embedding_config() -> bool {
-    std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("EMBEDDING_API_KEY").is_ok()
+    env_non_empty("GEMINI_API_KEY").is_some() || env_non_empty("EMBEDDING_API_KEY").is_some()
 }
 
 fn should_try_local_embedding(choice: EmbeddingProviderChoice) -> bool {
@@ -304,12 +322,12 @@ fn should_try_local_embedding(choice: EmbeddingProviderChoice) -> bool {
         EmbeddingProviderChoice::Local => true,
         EmbeddingProviderChoice::Gemini => false,
         EmbeddingProviderChoice::Auto => {
-            if std::env::var("EMBEDDING_MODEL").is_ok() {
+            if env_non_empty("EMBEDDING_MODEL").is_some() {
                 return true;
             }
-            std::env::var("LOCAL_LLM_URL").is_ok()
+            env_non_empty("LOCAL_LLM_URL").is_some()
                 && !has_gemini_embedding_config()
-                && std::env::var("EMBEDDING_GEMINI_MODEL").is_err()
+                && env_non_empty("EMBEDDING_GEMINI_MODEL").is_none()
         }
     }
 }
@@ -324,10 +342,10 @@ fn should_try_gemini_embedding(choice: EmbeddingProviderChoice) -> bool {
 
 async fn create_local_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
     let base_url =
-        std::env::var("LOCAL_LLM_URL").context("LOCAL_LLM_URL required for local embeddings")?;
+        env_non_empty("LOCAL_LLM_URL").context("LOCAL_LLM_URL required for local embeddings")?;
     let model =
-        std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text-v1.5".to_string());
-    let api_key = std::env::var("LOCAL_LLM_API_KEY").ok();
+        env_non_empty("EMBEDDING_MODEL").unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+    let api_key = env_non_empty("LOCAL_LLM_API_KEY");
     log::info!(
         "Probing embedding model '{}' at {} for dimensions...",
         model,
@@ -354,11 +372,11 @@ async fn create_local_embedding_provider() -> Result<Box<dyn EmbeddingProvider>>
 }
 
 async fn create_gemini_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .or_else(|_| std::env::var("EMBEDDING_API_KEY"))
+    let api_key = env_non_empty("GEMINI_API_KEY")
+        .or_else(|| env_non_empty("EMBEDDING_API_KEY"))
         .context("GEMINI_API_KEY or EMBEDDING_API_KEY required for embeddings")?;
-    let model = std::env::var("EMBEDDING_GEMINI_MODEL")
-        .unwrap_or_else(|_| "gemini-embedding-001".to_string());
+    let model = env_non_empty("EMBEDDING_GEMINI_MODEL")
+        .unwrap_or_else(|| "gemini-embedding-001".to_string());
     log::info!(
         "Probing Gemini embedding model '{}' for dimensions...",
         model
@@ -391,7 +409,7 @@ pub async fn create_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
         return create_gemini_embedding_provider().await;
     }
 
-    if choice == EmbeddingProviderChoice::Auto && std::env::var("LOCAL_LLM_URL").is_ok() {
+    if choice == EmbeddingProviderChoice::Auto && env_non_empty("LOCAL_LLM_URL").is_some() {
         return create_local_embedding_provider().await;
     }
 
@@ -411,32 +429,44 @@ pub async fn ensure_embedding_model(
     db: &crate::db::Database,
     provider: &dyn EmbeddingProvider,
 ) -> Result<()> {
+    let current_model = provider.model_name();
+    let current_dims = provider.dimensions().to_string();
     let stored_model = db.get_system_metadata("embedding_model").await?;
     let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
 
-    let current_model = provider.model_name();
-    let current_dims = provider.dimensions().to_string();
+    if matches!(
+        (&stored_model, &stored_dims),
+        (Some(sm), Some(sd)) if sm == current_model && *sd == current_dims
+    ) {
+        log::debug!(
+            "Embedding model unchanged: {} ({}d)",
+            current_model,
+            current_dims
+        );
+        return Ok(());
+    }
+
+    let _lock = db.acquire_embedding_model_lock().await?;
+    let stored_model = db.get_system_metadata("embedding_model").await?;
+    let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
 
     match (stored_model, stored_dims) {
+        (Some(ref sm), Some(ref sd)) if sm == current_model && *sd == current_dims => {
+            log::debug!("Embedding model unchanged after lock: {} ({}d)", sm, sd);
+            Ok(())
+        }
         (None, _) | (_, None) => {
             log::info!(
-                "Recording embedding model: {} ({}d)",
+                "Initializing embedding model: {} ({}d)",
                 current_model,
                 current_dims
             );
-            db.set_system_metadata("embedding_model", current_model)
-                .await?;
-            db.set_system_metadata("embedding_dimensions", &current_dims)
-                .await?;
-            Ok(())
-        }
-        (Some(ref sm), Some(ref sd)) if sm == current_model && *sd == current_dims => {
-            log::debug!("Embedding model unchanged: {} ({}d)", sm, sd);
-            Ok(())
+            reset_embedding_store(db, provider, current_model, &current_dims, None).await
         }
         (Some(sm), Some(sd)) => {
             let mode =
                 std::env::var("EMBEDDING_MODEL_MISMATCH").unwrap_or_else(|_| "rebuild".to_string());
+            let mode = mode.trim();
             if mode.eq_ignore_ascii_case("fail") || mode.eq_ignore_ascii_case("manual") {
                 anyhow::bail!(
                     "Embedding model mismatch!\n\
@@ -459,19 +489,47 @@ pub async fn ensure_embedding_model(
                 current_model,
                 current_dims
             );
-            let nulled = db.null_all_embeddings().await?;
-            db.rebuild_embedding_index(provider.dimensions()).await?;
-            db.set_system_metadata("embedding_model", current_model)
-                .await?;
-            db.set_system_metadata("embedding_dimensions", &current_dims)
-                .await?;
-            log::warn!(
-                "Embedding model reset complete; {} existing embedding(s) will be regenerated by embed-backfill/core embed work",
-                nulled
-            );
-            Ok(())
+            reset_embedding_store(db, provider, current_model, &current_dims, Some((&sm, &sd)))
+                .await
         }
     }
+}
+
+async fn reset_embedding_store(
+    db: &crate::db::Database,
+    provider: &dyn EmbeddingProvider,
+    current_model: &str,
+    current_dims: &str,
+    previous: Option<(&str, &str)>,
+) -> Result<()> {
+    let nulled = db.null_all_embeddings().await?;
+    db.rebuild_embedding_index(provider.dimensions()).await?;
+    db.set_system_metadata("embedding_model", current_model)
+        .await?;
+    db.set_system_metadata("embedding_dimensions", current_dims)
+        .await?;
+    if let Some((previous_model, previous_dims)) = previous {
+        log::warn!(
+            "Embedding model reset complete: {} ({}d) -> {} ({}d); {} existing embedding(s) will be regenerated by embed-backfill/core embed work",
+            previous_model,
+            previous_dims,
+            current_model,
+            current_dims,
+            nulled
+        );
+    } else if nulled > 0 {
+        log::warn!(
+            "Cleared {} embedding(s) with missing model metadata; they will be regenerated by embed-backfill/core embed work",
+            nulled
+        );
+    } else {
+        log::info!(
+            "Embedding index initialized for {} ({}d)",
+            current_model,
+            current_dims
+        );
+    }
+    Ok(())
 }
 
 /// Backwards-compatible name for callers/tests that still expect validation.
@@ -480,6 +538,32 @@ pub async fn validate_embedding_model(
     provider: &dyn EmbeddingProvider,
 ) -> Result<()> {
     ensure_embedding_model(db, provider).await
+}
+
+pub async fn assert_embedding_model_current(
+    db: &crate::db::Database,
+    provider: &dyn EmbeddingProvider,
+) -> Result<()> {
+    let stored_model = db.get_system_metadata("embedding_model").await?;
+    let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
+    let current_model = provider.model_name();
+    let current_dims = provider.dimensions().to_string();
+
+    match (stored_model, stored_dims) {
+        (Some(sm), Some(sd)) if sm == current_model && sd == current_dims => Ok(()),
+        (Some(sm), Some(sd)) => anyhow::bail!(
+            "Embedding model changed while embeddings were being generated. \
+             Generated: {} ({}d), current metadata: {} ({}d). Retry embed-backfill.",
+            current_model,
+            current_dims,
+            sm,
+            sd
+        ),
+        _ => anyhow::bail!(
+            "Embedding model metadata disappeared while embeddings were being generated. \
+             Retry embed-backfill."
+        ),
+    }
 }
 
 /// Truncate text to fit embedding model input limit (e.g. 2048 tokens ~ 8k chars).

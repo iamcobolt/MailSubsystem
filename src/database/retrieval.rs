@@ -3,11 +3,17 @@ use chrono::{DateTime, Utc};
 use mailparse::{parse_mail, ParsedMail};
 use pgvector::Vector;
 use serde_json::Value;
-use sqlx::{types::Json, Row};
+use sqlx::{types::Json, Postgres, Row, Transaction};
 
 use crate::config::DEFAULT_ACCOUNT_ID;
 use crate::db::Database;
 use crate::embeddings::clean_email_body_text;
+
+const EMBEDDING_MODEL_LOCK_KEY: i64 = 0x4d53_5345_4d42_4544;
+
+pub struct EmbeddingModelLock<'a> {
+    _tx: Transaction<'a, Postgres>,
+}
 
 /// Raw content of a thread/related message for RAG (subject, sender, body).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -518,6 +524,38 @@ impl Database {
 }
 
 impl Database {
+    /// Acquire a process-cooperative database lock for embedding model metadata
+    /// and vector index rebuilds.
+    pub async fn acquire_embedding_model_lock(&self) -> Result<EmbeddingModelLock<'_>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin embedding model lock transaction")?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(EMBEDDING_MODEL_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .context("acquire embedding model advisory lock")?;
+        Ok(EmbeddingModelLock { _tx: tx })
+    }
+
+    /// Acquire a shared lock while writing embeddings for the currently
+    /// configured model. Exclusive model resets wait for this lock.
+    pub async fn acquire_embedding_model_shared_lock(&self) -> Result<EmbeddingModelLock<'_>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin embedding model shared lock transaction")?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+            .bind(EMBEDDING_MODEL_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .context("acquire embedding model shared advisory lock")?;
+        Ok(EmbeddingModelLock { _tx: tx })
+    }
+
     /// Null all embeddings across accounts. Returns the number of rows affected.
     pub async fn null_all_embeddings(&self) -> Result<u64> {
         let result = sqlx::query(
