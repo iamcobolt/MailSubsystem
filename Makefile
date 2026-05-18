@@ -67,7 +67,7 @@ pipeline: build ## Run full pipeline: sync -> analyze -> locate -> file
 # ── Operator workflow ────────────────────────────────────────────────────────
 
 app: build ## Start server app: core coordinator + local API
-	$(BIN) app --bind 127.0.0.1:3100
+	$(BIN) app
 
 tui: build ## Start terminal UI
 	$(BIN) tui
@@ -86,8 +86,8 @@ core-status: build ## Show core queue depth, active work, pipeline timestamps, a
 core-smoke: build ## Verify the core DB/status path without starting HTTP API
 	$(BIN) core-status
 
-api: build ## Explicit API for wrappers on 127.0.0.1:3100 (no core coordinator)
-	$(BIN) api --bind 127.0.0.1:3100
+api: build ## Explicit API for wrappers (no core coordinator)
+	$(BIN) api
 
 migrate-schema: build ## Intentionally apply embedded schema.sql to configured database
 	$(BIN) migrate-schema --apply
