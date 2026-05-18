@@ -647,7 +647,7 @@ fn db_prerequisites_pending_markdown(
     }
 
     let mut details = Vec::new();
-    if snapshot.folder_count == 0 || snapshot.email_count == 0 {
+    if snapshot.folder_count == 0 {
         details.push("- Sync: mailbox folders or messages are still loading.".to_string());
     } else if snapshot.needs_full_sync_backfill() {
         details.push(format!(
@@ -2520,6 +2520,7 @@ mod tests {
             missing_message_id: 0,
             body_missing: 0,
             analysis_missing: 0,
+            embedding_missing: 0,
             location_missing: 0,
             filing_pending: 0,
             body_sync: Default::default(),
@@ -2538,6 +2539,18 @@ mod tests {
             classify_db_prerequisite_work(&snapshot),
             vec![CoreWorkType::SyncFull]
         );
+    }
+
+    #[test]
+    fn test_classify_db_prerequisite_work_allows_observed_empty_mailbox() {
+        let snapshot = DbCompletenessSnapshot {
+            folder_count: 6,
+            largest_folder_message_count: 0,
+            email_count: 0,
+            ..ready_db_snapshot()
+        };
+
+        assert!(classify_db_prerequisite_work(&snapshot).is_empty());
     }
 
     #[test]

@@ -83,11 +83,7 @@ pub async fn run_sync_for_account(account: &AccountConfig) -> anyhow::Result<()>
             .last_synced_uid
             .map(|u| (u as u32).saturating_add(1))
             .unwrap_or(1);
-
-        eprintln!(
-            "  {}: syncing from UID {} (low-to-high)...",
-            folder_name, start_uid
-        );
+        let mut logged_folder_state = false;
 
         loop {
             let (mailbox, envelopes) = client
@@ -140,6 +136,24 @@ pub async fn run_sync_for_account(account: &AccountConfig) -> anyhow::Result<()>
             }
 
             let uid_end = mailbox.uid_next.map(|n| n.saturating_sub(1)).unwrap_or(0);
+            if !logged_folder_state {
+                if mailbox.exists == 0 {
+                    eprintln!("  {}: empty mailbox; nothing to sync", folder_name);
+                } else if start_uid > uid_end {
+                    eprintln!(
+                        "  {}: up to date (last_synced_uid={}, uid_next={})",
+                        folder_name,
+                        folder.last_synced_uid.unwrap_or(0),
+                        mailbox.uid_next.unwrap_or(0)
+                    );
+                } else {
+                    eprintln!(
+                        "  {}: syncing from UID {} to {} (low-to-high)...",
+                        folder_name, start_uid, uid_end
+                    );
+                }
+                logged_folder_state = true;
+            }
             if envelopes.is_empty() {
                 if uid_end == 0 {
                     database

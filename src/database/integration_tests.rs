@@ -30,6 +30,7 @@ fn test_db_completeness_snapshot_backlog_detection() {
         missing_message_id: 0,
         body_missing: 0,
         analysis_missing: 0,
+        embedding_missing: 0,
         location_missing: 0,
         filing_pending: 0,
         body_sync: BodySyncQueueDepth {
@@ -46,6 +47,15 @@ fn test_db_completeness_snapshot_backlog_detection() {
         ..ready.clone()
     };
     assert!(!non_blocking_missing.has_active_backlog());
+
+    let ready_empty_mailbox = DbCompletenessSnapshot {
+        folder_count: 4,
+        largest_folder_message_count: 0,
+        email_count: 0,
+        ..ready.clone()
+    };
+    assert!(!ready_empty_mailbox.needs_full_sync_backfill());
+    assert!(!ready_empty_mailbox.has_active_backlog());
 
     let blocked_empty = DbCompletenessSnapshot {
         folder_count: 0,
@@ -74,6 +84,12 @@ fn test_db_completeness_snapshot_backlog_detection() {
         ..ready.clone()
     };
     assert!(blocked_analysis.has_active_backlog());
+
+    let blocked_embedding = DbCompletenessSnapshot {
+        embedding_missing: 1,
+        ..ready.clone()
+    };
+    assert!(blocked_embedding.has_active_backlog());
 
     let blocked_location = DbCompletenessSnapshot {
         location_missing: 1,

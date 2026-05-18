@@ -608,6 +608,13 @@ fn follow_up_work_plan(
     {
         plan.push((CoreWorkType::Analyze, "analysis_backlog"));
     }
+    if snapshot.embedding_missing > 0
+        && !plan
+            .iter()
+            .any(|(work_type, _)| *work_type == CoreWorkType::Embed)
+    {
+        plan.push((CoreWorkType::Embed, "embedding_backlog"));
+    }
     if snapshot.location_missing > 0
         && !plan
             .iter()
@@ -643,6 +650,9 @@ fn idle_work_plan(
     }
     if snapshot.analysis_missing > 0 {
         plan.push((CoreWorkType::Analyze, "analysis_backlog"));
+    }
+    if snapshot.embedding_missing > 0 {
+        plan.push((CoreWorkType::Embed, "embedding_backlog"));
     }
     if snapshot.location_missing > 0 {
         plan.push((CoreWorkType::Locate, "location_backlog"));
@@ -712,17 +722,6 @@ async fn execute_work(
 ) -> anyhow::Result<()> {
     match work.work_type {
         CoreWorkType::SyncFull => {
-            let db = runtime_services::load_database("core full sync").await?;
-            let reset = db
-                .reset_folder_sync_cursors_for_account(&config.account_id)
-                .await
-                .context("reset folder sync cursors for full sync")?;
-            if reset > 0 {
-                log::info!(
-                    "[core] reset {} folder sync cursor(s) before full sync",
-                    reset
-                );
-            }
             let account = AccountConfig::load(&config.account_id).context("load account config")?;
             sync_runtime::run_sync_for_account(&account).await
         }
@@ -1037,8 +1036,21 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_requeues_embedding_backlog() {
+        let snapshot = db::DbCompletenessSnapshot {
+            embedding_missing: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            follow_up_work_plan(CoreWorkType::Locate, true, &snapshot),
+            vec![(CoreWorkType::Embed, "embedding_backlog")]
+        );
+    }
+
+    #[test]
     fn idle_work_plan_keeps_core_syncing_when_backlog_is_clear() {
         let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
             email_count: 10,
             ..Default::default()
         };
@@ -1052,6 +1064,7 @@ mod tests {
     #[test]
     fn idle_work_plan_recovers_partial_database() {
         let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
             largest_folder_message_count: 1000,
             email_count: 29,
             ..Default::default()
@@ -1066,8 +1079,10 @@ mod tests {
     #[test]
     fn idle_work_plan_requeues_missing_backlog() {
         let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
             email_count: 10,
             analysis_missing: 12,
+            embedding_missing: 5,
             location_missing: 7,
             ..Default::default()
         };
@@ -1077,6 +1092,7 @@ mod tests {
             vec![
                 (CoreWorkType::SyncIncremental, "core_idle_poll"),
                 (CoreWorkType::Analyze, "analysis_backlog"),
+                (CoreWorkType::Embed, "embedding_backlog"),
                 (CoreWorkType::Locate, "location_backlog")
             ]
         );
@@ -1091,8 +1107,24 @@ mod tests {
     }
 
     #[test]
+    fn idle_work_plan_treats_observed_empty_mailbox_as_current() {
+        let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
+            largest_folder_message_count: 0,
+            email_count: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            idle_work_plan(&snapshot, false),
+            vec![(CoreWorkType::SyncIncremental, "core_idle_poll")]
+        );
+    }
+
+    #[test]
     fn idle_work_plan_applies_filing_backlog_only_when_enabled() {
         let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
             email_count: 10,
             filing_pending: 3,
             ..Default::default()

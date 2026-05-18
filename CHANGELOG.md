@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed a core sync loop where `sync_full` erased folder UID cursors before each
+  backfill run, causing folders to restart from UID 1 instead of resuming.
+- Fixed observed-empty mailboxes being treated as permanently incomplete, which
+  repeatedly queued `sync_full` with `blank_database` even after IMAP folders had
+  been discovered and reported zero messages.
+- Clarified full-sync folder logs so empty and up-to-date folders are reported
+  explicitly instead of appearing to restart from UID 1.
+
 ## v0.1.0 - 2026-05-17
 
 Initial public-release candidate for MailSubsystem Core.
