@@ -15,6 +15,11 @@ pub const DB_COMPLETENESS_PENDING_STATUS: &str = "prerequisites_pending";
 
 const API_CHAT_TASK_PREFIX: &str = "api-chat-";
 const DEFAULT_INTERACTIVE_DB_COMPLETENESS_MAX_WAIT_SECS: u64 = 15;
+const ANALYSIS_EVIDENCE_PREFETCH_STEP: usize = 0;
+const ANALYSIS_SENDER_HISTORY_LIMIT: i64 = 12;
+const ANALYSIS_SIMILAR_EMAIL_LIMIT: i64 = 8;
+const ANALYSIS_SIMILAR_MAX_DISTANCE: f64 = 0.35;
+const ANALYSIS_SIMILAR_QUERY_BODY_CHARS: usize = 2_500;
 
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -151,6 +156,10 @@ fn classify_db_prerequisite_work(snapshot: &DbCompletenessSnapshot) -> Vec<CoreW
         work.push(CoreWorkType::Analyze);
     }
 
+    if snapshot.embedding_missing > 0 {
+        work.push(CoreWorkType::Embed);
+    }
+
     if snapshot.location_missing > 0 {
         work.push(CoreWorkType::Locate);
     }
@@ -165,6 +174,7 @@ fn core_work_type_names(work: &[CoreWorkType]) -> Vec<&'static str> {
 fn pending_retry_after_seconds(snapshot: &DbCompletenessSnapshot) -> u64 {
     let backlog = snapshot.body_missing
         + snapshot.analysis_missing
+        + snapshot.embedding_missing
         + snapshot.location_missing
         + snapshot.body_sync.pending
         + snapshot.body_sync.failed
@@ -400,6 +410,107 @@ fn count_emails_tool_args_for_input(input: &Value) -> Value {
     Value::Object(args)
 }
 
+fn should_prefetch_analysis_evidence(agent_name: &str) -> bool {
+    agent_name.eq_ignore_ascii_case("email-analyzer")
+}
+
+fn non_empty_text_field<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> &str {
+    let end = input
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len());
+    &input[..end]
+}
+
+fn analysis_similar_query_for_input(input: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(subject) = non_empty_text_field(input, "subject") {
+        parts.push(format!("Subject: {}", subject));
+    }
+    if let Some(sender) = non_empty_text_field(input, "sender") {
+        parts.push(format!("Sender: {}", sender));
+    }
+    if let Some(list_id) = non_empty_text_field(input, "list_id") {
+        parts.push(format!("List-ID: {}", list_id));
+    }
+    if let Some(body) = non_empty_text_field(input, "body_text") {
+        parts.push(format!(
+            "Body excerpt: {}",
+            truncate_chars(body, ANALYSIS_SIMILAR_QUERY_BODY_CHARS)
+        ));
+    }
+    parts.join("\n")
+}
+
+fn analysis_evidence_tool_args_for_input(input: &Value) -> Vec<(&'static str, Value)> {
+    let sender = non_empty_text_field(input, "sender").unwrap_or_default();
+    let message_id = non_empty_text_field(input, "message_id");
+    let mut calls = Vec::new();
+
+    let mut sender_history = json!({
+        "sender": sender,
+        "limit": ANALYSIS_SENDER_HISTORY_LIMIT,
+    });
+    if let (Some(object), Some(message_id)) = (sender_history.as_object_mut(), message_id) {
+        object.insert(
+            "exclude_message_id".to_string(),
+            Value::String(message_id.to_string()),
+        );
+    }
+    calls.push(("get_sender_history", sender_history));
+
+    let query = analysis_similar_query_for_input(input);
+    if !query.trim().is_empty() {
+        let mut similar = json!({
+            "query": query,
+            "limit": ANALYSIS_SIMILAR_EMAIL_LIMIT,
+            "max_distance": ANALYSIS_SIMILAR_MAX_DISTANCE,
+        });
+        if let Some(object) = similar.as_object_mut() {
+            for field in [
+                "sender",
+                "category",
+                "email_type",
+                "organization",
+                "list_id",
+                "message_id",
+            ] {
+                if let Some(value) = non_empty_text_field(input, field) {
+                    let key = if field == "message_id" {
+                        "exclude_message_id"
+                    } else {
+                        field
+                    };
+                    object.insert(key.to_string(), Value::String(value.to_string()));
+                }
+            }
+        }
+        calls.push(("search_similar_emails", similar));
+    }
+
+    calls
+}
+
+fn analysis_evidence_prompt(evidence_parts: &[String]) -> Option<String> {
+    if evidence_parts.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Required email-analyzer evidence has already been fetched by the harness. Use these results as if you had called the tools yourself. Do not call `get_sender_history` or `search_similar_emails` again unless absolutely necessary; return the final JSON object when ready.\n\n{}",
+        evidence_parts.join("\n\n")
+    ))
+}
+
 fn is_unfiltered_count_text(text: &str) -> bool {
     let asks_for_count =
         text.contains("count") || text.contains("how many") || text.contains("number of");
@@ -590,8 +701,9 @@ fn db_prerequisites_pending_output(
         "status": DB_COMPLETENESS_PENDING_STATUS,
         "response_markdown": response_markdown,
         "summary": format!(
-            "Mailbox prerequisites are still pending: {} emails need analysis and {} need filing recommendations.",
+            "Mailbox prerequisites are still pending: {} emails need analysis, {} need embeddings, and {} need filing recommendations.",
             snapshot.analysis_missing,
+            snapshot.embedding_missing,
             snapshot.location_missing
         ),
         "confidence": 1.0,
@@ -610,6 +722,7 @@ fn db_prerequisites_pending_output(
             "missing_message_id": snapshot.missing_message_id,
             "body_missing": snapshot.body_missing,
             "analysis_missing": snapshot.analysis_missing,
+            "embedding_missing": snapshot.embedding_missing,
             "location_missing": snapshot.location_missing,
             "body_sync": {
                 "pending": snapshot.body_sync.pending,
@@ -685,6 +798,12 @@ fn db_prerequisites_pending_markdown(
         details.push(format!(
             "- Analysis: {} emails still need classification and safety analysis.",
             snapshot.analysis_missing
+        ));
+    }
+    if snapshot.embedding_missing > 0 {
+        details.push(format!(
+            "- Embeddings: {} emails still need semantic-search embeddings.",
+            snapshot.embedding_missing
         ));
     }
     if snapshot.location_missing > 0 {
@@ -778,6 +897,7 @@ impl AgentHarness {
             "missing_message_id": snapshot.missing_message_id,
             "body_missing": snapshot.body_missing,
             "analysis_missing": snapshot.analysis_missing,
+            "embedding_missing": snapshot.embedding_missing,
             "location_missing": snapshot.location_missing,
             "body_sync_pending": snapshot.body_sync.pending,
             "body_sync_failed": snapshot.body_sync.failed,
@@ -1247,6 +1367,7 @@ impl AgentHarness {
 
         let mut messages = self.build_initial_messages(&input).await?;
 
+        let mut resumed_from_checkpoint = false;
         if let Some(checkpoint) = self.state.latest_checkpoint(&run_id).await? {
             log::info!(
                 "[harness] resuming run {} from checkpoint at step {}",
@@ -1254,6 +1375,71 @@ impl AgentHarness {
                 checkpoint.step
             );
             messages = checkpoint.messages;
+            resumed_from_checkpoint = true;
+        }
+
+        if !resumed_from_checkpoint && should_prefetch_analysis_evidence(&self.spec.name) {
+            let evidence_calls = analysis_evidence_tool_args_for_input(&input);
+            if total_tool_calls + evidence_calls.len() as u32
+                > self.spec.budget.max_tool_calls as u32
+            {
+                bail!(
+                    "budget exceeded: max_tool_calls ({}) reached before analyzer evidence prefetch",
+                    self.spec.budget.max_tool_calls
+                );
+            }
+
+            let mut evidence_parts = Vec::new();
+            for (tool_name, args) in evidence_calls {
+                let t0 = Instant::now();
+                Self::emit_event(
+                    callback.as_ref(),
+                    HarnessEvent::ToolCall {
+                        step: ANALYSIS_EVIDENCE_PREFETCH_STEP,
+                        tool_name: tool_name.to_string(),
+                        arguments: args.clone(),
+                    },
+                );
+                let result = match self.tools.execute(tool_name, args.clone()).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        log::warn!(
+                            "[harness] analyzer evidence prefetch failed tool={}: {}",
+                            tool_name,
+                            error
+                        );
+                        json!({ "error": error.to_string() }).to_string()
+                    }
+                };
+                let latency_ms = t0.elapsed().as_millis() as u64;
+                self.state
+                    .log_tool_call(
+                        &run_id,
+                        ANALYSIS_EVIDENCE_PREFETCH_STEP,
+                        tool_name,
+                        &args,
+                        &result,
+                        latency_ms,
+                    )
+                    .await?;
+                self.state.record_tool_calls(&run_id, 1).await?;
+                Self::emit_event(
+                    callback.as_ref(),
+                    HarnessEvent::ToolResult {
+                        step: ANALYSIS_EVIDENCE_PREFETCH_STEP,
+                        tool_name: tool_name.to_string(),
+                        result: result.clone(),
+                        latency_ms,
+                    },
+                );
+                used_tool_names.push(tool_name.to_string());
+                total_tool_calls += 1;
+                evidence_parts.push(format!("[{}]: {}", tool_name, result));
+            }
+
+            if let Some(prompt) = analysis_evidence_prompt(&evidence_parts) {
+                messages.push(Message::user(prompt));
+            }
         }
 
         if requires_count_emails_tool && !used_tool_names.iter().any(|name| name == "count_emails")
@@ -2495,6 +2681,76 @@ mod tests {
     }
 
     #[test]
+    fn test_email_analyzer_prefetches_required_evidence_tools() {
+        assert!(should_prefetch_analysis_evidence("email-analyzer"));
+        assert!(should_prefetch_analysis_evidence("EMAIL-ANALYZER"));
+        assert!(!should_prefetch_analysis_evidence("location-agent"));
+
+        let long_body = "a".repeat(ANALYSIS_SIMILAR_QUERY_BODY_CHARS + 25);
+        let calls = analysis_evidence_tool_args_for_input(&json!({
+            "message_id": "msg-1",
+            "subject": "Invoice ready",
+            "sender": "billing@example.com",
+            "body_text": long_body,
+            "category": "financial",
+            "email_type": "transactional",
+            "organization": "Example Billing",
+            "list_id": "billing.example.com",
+        }));
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "get_sender_history");
+        assert_eq!(calls[0].1["sender"], "billing@example.com");
+        assert_eq!(calls[0].1["limit"], ANALYSIS_SENDER_HISTORY_LIMIT);
+        assert_eq!(calls[0].1["exclude_message_id"], "msg-1");
+
+        assert_eq!(calls[1].0, "search_similar_emails");
+        assert_eq!(calls[1].1["limit"], ANALYSIS_SIMILAR_EMAIL_LIMIT);
+        assert_eq!(calls[1].1["max_distance"], ANALYSIS_SIMILAR_MAX_DISTANCE);
+        assert_eq!(calls[1].1["sender"], "billing@example.com");
+        assert_eq!(calls[1].1["exclude_message_id"], "msg-1");
+        let query = calls[1].1["query"].as_str().expect("query string");
+        assert!(query.contains("Subject: Invoice ready"));
+        assert!(query.contains("Sender: billing@example.com"));
+        assert!(query.contains("List-ID: billing.example.com"));
+        assert!(!query.contains(&"a".repeat(ANALYSIS_SIMILAR_QUERY_BODY_CHARS + 1)));
+    }
+
+    #[test]
+    fn test_email_analyzer_prefetch_omits_empty_similarity_query() {
+        let calls = analysis_evidence_tool_args_for_input(&json!({
+            "message_id": "msg-blank",
+            "subject": "   ",
+            "sender": "   ",
+            "body_text": "",
+            "list_id": null,
+        }));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "get_sender_history");
+        assert_eq!(calls[0].1["sender"], "");
+        assert_eq!(calls[0].1["exclude_message_id"], "msg-blank");
+    }
+
+    #[test]
+    fn test_email_analyzer_evidence_prompt_embeds_tool_results() {
+        assert!(analysis_evidence_prompt(&[]).is_none());
+
+        let prompt = analysis_evidence_prompt(&[
+            "[get_sender_history]: []".to_string(),
+            "[search_similar_emails]: [{\"message_id\":\"prior\"}]".to_string(),
+        ])
+        .expect("prompt");
+
+        assert!(prompt.contains("already been fetched by the harness"));
+        assert!(prompt.contains("as if you had called the tools yourself"));
+        assert!(prompt.contains("Do not call `get_sender_history`"));
+        assert!(prompt.contains("return the final JSON object"));
+        assert!(prompt.contains("[get_sender_history]: []"));
+        assert!(prompt.contains("[search_similar_emails]: [{\"message_id\":\"prior\"}]"));
+    }
+
+    #[test]
     fn test_deferred_tool_promise_detection() {
         assert!(output_promises_deferred_tool_work(&json!({
             "response_markdown": "I will run that count now. Please wait while I retrieve it.",
@@ -2631,6 +2887,19 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_db_prerequisite_work_for_missing_embeddings() {
+        let snapshot = DbCompletenessSnapshot {
+            embedding_missing: 2,
+            ..ready_db_snapshot()
+        };
+
+        assert_eq!(
+            classify_db_prerequisite_work(&snapshot),
+            vec![CoreWorkType::Embed]
+        );
+    }
+
+    #[test]
     fn test_classify_db_prerequisite_work_for_missing_location() {
         let snapshot = DbCompletenessSnapshot {
             location_missing: 1,
@@ -2651,10 +2920,15 @@ mod tests {
                 email_count: 939,
                 missing_message_id: 1,
                 analysis_missing: 931,
+                embedding_missing: 45,
                 location_missing: 4,
                 ..ready_db_snapshot()
             },
-            requested_work: vec![CoreWorkType::Analyze, CoreWorkType::Locate],
+            requested_work: vec![
+                CoreWorkType::Analyze,
+                CoreWorkType::Embed,
+                CoreWorkType::Locate,
+            ],
             stable_polls: 2,
             elapsed: Duration::from_secs(15),
             max_wait: Duration::from_secs(15),
@@ -2672,9 +2946,12 @@ mod tests {
         assert_eq!(output["needs_specialist"], false);
         assert_eq!(output["confidence"], 1.0);
         assert_eq!(output["db_completeness"]["analysis_missing"], 931);
+        assert_eq!(output["db_completeness"]["embedding_missing"], 45);
         assert_eq!(output["requested_work"][0], "analyze");
+        assert_eq!(output["requested_work"][1], "embed");
         let markdown = output["response_markdown"].as_str().unwrap_or_default();
         assert!(markdown.contains("931 emails still need classification"));
+        assert!(markdown.contains("45 emails still need semantic-search embeddings"));
         assert!(markdown.contains("try again in about 30 seconds"));
     }
 }
