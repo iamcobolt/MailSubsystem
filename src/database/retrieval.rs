@@ -25,6 +25,7 @@ pub struct SimilarEmailResult {
     pub message_id: String,
     pub subject: Option<String>,
     pub sender: Option<String>,
+    pub location: Option<String>,
     pub human_summary: Option<String>,
     pub organization: Option<String>,
     pub list_id: Option<String>,
@@ -972,7 +973,7 @@ impl Database {
         let v = Vector::from(query.embedding.to_vec());
         let rows = sqlx::query(
             r#"
-            SELECT message_id, subject, sender, human_summary, organization, list_id,
+            SELECT message_id, subject, sender, location, human_summary, organization, list_id,
                    spam_status, marketing_status, email_type, category, topic,
                    (embedding <=> $2)::float as distance
             FROM emails
@@ -1028,6 +1029,7 @@ impl Database {
                 message_id: r.get("message_id"),
                 subject: r.get("subject"),
                 sender: r.get("sender"),
+                location: r.get("location"),
                 human_summary: r.get("human_summary"),
                 organization: r.get("organization"),
                 list_id: r.get("list_id"),
@@ -1075,6 +1077,7 @@ impl Database {
                 e.message_id,
                 e.subject,
                 e.sender,
+                e.location,
                 e.human_summary,
                 e.organization,
                 e.list_id,
@@ -1160,6 +1163,7 @@ impl Database {
                 c.message_id,
                 c.subject,
                 c.sender,
+                c.location,
                 c.human_summary,
                 c.organization,
                 c.list_id,
@@ -1178,6 +1182,7 @@ impl Database {
               message_id,
               subject,
               sender,
+              location,
               human_summary,
               organization,
               list_id,
@@ -1236,6 +1241,7 @@ impl Database {
                 message_id: r.get("message_id"),
                 subject: r.get("subject"),
                 sender: r.get("sender"),
+                location: r.get("location"),
                 human_summary: r.get("human_summary"),
                 organization: r.get("organization"),
                 list_id: r.get("list_id"),

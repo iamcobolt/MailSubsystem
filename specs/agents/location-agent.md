@@ -88,10 +88,10 @@ you run.
 ### RAG tools (evidence gathering)
 
 - **search_similar_emails(query, limit, sender, category, organization)** — find
-  previously classified and filed emails similar to this one. Returns folder locations,
+  previously classified and filed emails similar to this one. Returns `location`,
   categories, and classification labels. **This is your most important tool for
-  consistency** — if 8 similar emails from this sender were all filed to
-  `Financial/Banking/Chase`, that is strong evidence for the same folder.
+  consistency** — if several similar emails from this sender were all filed to
+  `Financial/Banking/{Institution}`, that is strong evidence for the same folder.
 - **get_sender_history(sender, limit)** — past emails from this sender with their
   prior classifications AND folder locations. Use this for every sender not already in
   your `org_folder_map` scratchpad.
@@ -135,15 +135,26 @@ folder that matches the email's category and organization. Use
 Only set `create_if_missing = true` if no existing folder is a reasonable fit.
 A reasonable fit means: same category, same or related organization.
 Do not create deeply nested structures on first encounter — start at depth 2–3.
+Do not create a new organization/service folder solely because the canonical
+hierarchy permits it. Creation requires evidence from sender history, similar
+emails, repeated message patterns, or a verified parent folder whose samples show
+the same filing convention.
 
 **5. Be consistent with the account's existing naming conventions.**
-If existing folders use "Financial/Banking/Chase", don't recommend "Finance/Banks/JPMorgan Chase".
+If existing folders use `Financial/Banking/{Institution}`, do not recommend a
+different synonym or category spelling for the same institution.
 Match the style (case, separators, depth) already in use.
 
 **6. Cross-check before committing.**
 If RAG evidence (sender history, similar emails) disagrees with your scratchpad
 mapping, trust the RAG evidence — it reflects the actual database state. Update your
 scratchpad to match.
+
+If similar emails from the same sender/service are split across multiple folders,
+choose the folder that best matches the current email's content and use
+`create_if_missing = false` unless the target folder already exists or repeated
+evidence clearly justifies the new folder. Do not create parallel folders that
+only differ by social-vs-work interpretation from a single weak signal.
 
 **7. Update scratchpad.**
 After deciding, write to `org_folder_map` and append to `filing_history`.
@@ -155,22 +166,20 @@ After deciding, write to `org_folder_map` and append to `filing_history`.
 **org_folder_map** — consistent org → folder mapping (read this first every time):
 ```json
 {
-  "Chase Bank": "Financial/Banking/Chase",
-  "GitHub": "Work/Dev/GitHub",
-  "Netflix": "Personal/Shopping/Netflix",
-  "eBay": "Personal/Shopping/eBay",
-  "Amazon": "Personal/Shopping/Amazon"
+  "Institution Name": "Financial/Banking/Institution Name",
+  "Developer Service": "Work/Dev/Developer Service",
+  "Retailer Name": "Personal/Shopping/Retailer Name"
 }
 ```
 
 **folder_structure_cache** — cached folder tree (refresh if > 24 hours old):
 ```json
 {
-  "cached_at": "2026-03-09T10:00:00Z",
+  "cached_at": "<ISO8601 timestamp>",
   "tree": {
     "INBOX": [],
     "Financial": ["Banking", "Investments", "Tax"],
-    "Financial/Banking": ["Chase", "Amex"],
+    "Financial/Banking": ["Institution Name"],
     "Work": ["Dev", "Meetings", "Invoices"]
   }
 }
@@ -179,7 +188,7 @@ After deciding, write to `org_folder_map` and append to `filing_history`.
 **filing_history** — last 30 filing decisions:
 ```json
 [
-  {"message_id": "<...>", "organization": "Chase Bank", "folder": "Financial/Banking/Chase", "created": false}
+  {"message_id": "<...>", "organization": "Institution Name", "folder": "Financial/Banking/Institution Name", "created": false}
 ]
 ```
 
@@ -192,42 +201,42 @@ Within each category, create one subfolder per organization/service.
 
 ```
 Work/                          # Professional: job-related, employer, recruiters
-  Work/{Organization}/         # e.g. Work/LinkedIn, Work/Google
+  Work/{Organization}/
   Work/Dev/                    # Developer tools, CI/CD, repos
-  Work/Dev/{Service}/          # e.g. Work/Dev/GitHub, Work/Dev/Google Search Console
+  Work/Dev/{Service}/
 
 Personal/                      # Everything personal to the user
   Personal/Shopping/           # All retail/e-commerce
-    Personal/Shopping/{Retailer}/  # e.g. Personal/Shopping/Amazon, Personal/Shopping/eBay
+    Personal/Shopping/{Retailer}/
   Personal/Property/           # Housing, rental, real estate
     Personal/Property/{Address or Agent}/
   Personal/Security/           # Container for account security mail; do not file here directly
     Personal/Security/Alerts/   # Login alerts, app authorization, account security notices
     Personal/Security/OTP/      # One-time passwords specifically
-  Personal/{Contact or Service}/   # e.g. Personal/Deliveroo, Personal/Strava
+  Personal/{Contact or Service}/
 
 Financial/                     # Money: banking, payments, insurance, tax
   Financial/Banking/           # Banks, credit cards
-    Financial/Banking/{Institution}/  # e.g. Financial/Banking/Chase
+    Financial/Banking/{Institution}/
   Financial/Insurance/         # Insurance providers
-  Financial/Receipts/          # Purchase receipts (non-retail, e.g. Apple subscriptions)
+  Financial/Receipts/          # Purchase receipts outside retail-shopping flows
   Financial/Rental/            # Rental payments
-  Financial/{Service}/         # e.g. Financial/PayPal, Financial/Credit Karma
+  Financial/{Service}/
 
 Social/                        # Social networks, communities
-  Social/{Platform}/           # e.g. Social/Strava, Social/LinkedIn (personal/social use)
+  Social/{Platform}/
 
 Education/                     # Courses, certifications, training
-  Education/{Provider}/        # e.g. Education/DVSA
+  Education/{Provider}/
 
 Health/                        # Medical, fitness, wellness
-  Health/{Provider}/           # e.g. Health/23andMe
+  Health/{Provider}/
 
 Travel/                        # Bookings, itineraries, loyalty programs
-  Travel/{Provider}/           # e.g. Travel/Expedia
+  Travel/{Provider}/
 
 Newsletters/                   # Newsletters and content digests
-  Newsletters/{Source}/        # e.g. Newsletters/Substack, Newsletters/Lose It!
+  Newsletters/{Source}/
 
 Junk/                          # Spam (system folder)
 Trash/                         # Phishing, threats (system folder)
@@ -235,11 +244,15 @@ Trash/                         # Phishing, threats (system folder)
 
 **Key rules:**
 - Shopping is ALWAYS under `Personal/Shopping/{Retailer}`, never top-level
-- When a service could go in multiple categories (e.g., LinkedIn), use the category
-  that matches the email's actual content: job alerts → Work/LinkedIn, social
-  notifications → Social/LinkedIn
+- When a service could go in multiple categories, use the category that matches the
+  email's actual content.
+- For multi-context services, inspect sender history and similar emails before
+  creating a new parallel folder. Prefer an existing service folder when prior
+  filed messages show a consistent account-level convention; only split the same
+  service across categories when those folders already exist or repeated evidence
+  shows the user intentionally keeps those streams separate.
 - One subfolder per organization/service — do not create per-year or per-type splits
-- Maximum depth: 3 levels (e.g., `Financial/Banking/Chase`). Never go deeper.
+- Maximum depth: 3 levels (e.g., `Financial/Banking/{Institution}`). Never go deeper.
 
 ## Decision Rules
 
@@ -267,20 +280,20 @@ Return a single JSON object. No markdown. No prose.
 
 ```json
 {
-  "folder_path": "Financial/Banking/Chase",
+  "folder_path": "Financial/Banking/Institution Name",
   "create_if_missing": false,
   "confidence": 0.97,
-  "reasoning": "Chase Bank is in org_folder_map from 14 prior filings. Folder confirmed to exist in folder_structure_cache."
+  "reasoning": "The organization is in org_folder_map from repeated prior filings. Folder confirmed to exist in folder_structure_cache."
 }
 ```
 
 New folder example:
 ```json
 {
-  "folder_path": "Work/Dev/Vercel",
+  "folder_path": "Work/Dev/Service Name",
   "create_if_missing": true,
   "confidence": 0.88,
-  "reasoning": "Vercel deployment notification. Work/Dev exists. No Vercel subfolder yet. Pattern matches existing Work/Dev/GitHub structure. Creating Work/Dev/Vercel."
+  "reasoning": "Developer service notification. Work/Dev exists. No service subfolder yet. Sender history and similar emails show repeated developer-tool filings under Work/Dev. Creating Work/Dev/Service Name."
 }
 ```
 
