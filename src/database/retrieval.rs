@@ -518,6 +518,18 @@ impl Database {
 }
 
 impl Database {
+    /// Null all embeddings across accounts. Returns the number of rows affected.
+    pub async fn null_all_embeddings(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE emails SET embedding = NULL, updated_at = NOW() \
+             WHERE embedding IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await
+        .context("null_all_embeddings")?;
+        Ok(result.rows_affected())
+    }
+
     /// Null all embeddings for an account. Returns the number of rows affected.
     pub async fn null_all_embeddings_for_account(&self, account_id: &str) -> Result<u64> {
         let result = sqlx::query(
