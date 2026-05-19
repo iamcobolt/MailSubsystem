@@ -25,6 +25,7 @@ fn test_analysis_backoff_intervals_are_exponential() {
 fn test_db_completeness_snapshot_backlog_detection() {
     let ready = DbCompletenessSnapshot {
         folder_count: 4,
+        selectable_folders_missing_counts: 0,
         largest_folder_message_count: 42,
         email_count: 42,
         missing_message_id: 0,
@@ -56,6 +57,15 @@ fn test_db_completeness_snapshot_backlog_detection() {
     };
     assert!(!ready_empty_mailbox.needs_full_sync_backfill());
     assert!(!ready_empty_mailbox.has_active_backlog());
+
+    let blocked_unobserved_folder_counts = DbCompletenessSnapshot {
+        selectable_folders_missing_counts: 2,
+        largest_folder_message_count: 0,
+        email_count: 0,
+        ..ready.clone()
+    };
+    assert!(blocked_unobserved_folder_counts.needs_full_sync_backfill());
+    assert!(blocked_unobserved_folder_counts.has_active_backlog());
 
     let blocked_empty = DbCompletenessSnapshot {
         folder_count: 0,

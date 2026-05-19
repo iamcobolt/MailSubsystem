@@ -631,7 +631,9 @@ fn idle_work_plan(
     file_apply_enabled: bool,
 ) -> Vec<(CoreWorkType, &'static str)> {
     let mut plan = if snapshot.needs_full_sync_backfill() {
-        let reason = if snapshot.email_count == 0 {
+        let reason = if snapshot.selectable_folders_missing_counts > 0 {
+            "folder_count_backfill"
+        } else if snapshot.email_count == 0 {
             "blank_database"
         } else {
             "partial_database_backfill"
@@ -1118,6 +1120,22 @@ mod tests {
         assert_eq!(
             idle_work_plan(&snapshot, false),
             vec![(CoreWorkType::SyncIncremental, "core_idle_poll")]
+        );
+    }
+
+    #[test]
+    fn idle_work_plan_resumes_when_folder_counts_are_unobserved() {
+        let snapshot = db::DbCompletenessSnapshot {
+            folder_count: 6,
+            selectable_folders_missing_counts: 2,
+            largest_folder_message_count: 0,
+            email_count: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            idle_work_plan(&snapshot, false),
+            vec![(CoreWorkType::SyncFull, "folder_count_backfill")]
         );
     }
 

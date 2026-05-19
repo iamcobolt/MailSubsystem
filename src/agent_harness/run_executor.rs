@@ -604,6 +604,7 @@ fn db_prerequisites_pending_output(
         "db_completeness": {
             "ready": false,
             "folder_count": snapshot.folder_count,
+            "selectable_folders_missing_counts": snapshot.selectable_folders_missing_counts,
             "email_count": snapshot.email_count,
             "largest_folder_message_count": snapshot.largest_folder_message_count,
             "missing_message_id": snapshot.missing_message_id,
@@ -649,6 +650,11 @@ fn db_prerequisites_pending_markdown(
     let mut details = Vec::new();
     if snapshot.folder_count == 0 {
         details.push("- Sync: mailbox folders or messages are still loading.".to_string());
+    } else if snapshot.selectable_folders_missing_counts > 0 {
+        details.push(format!(
+            "- Sync: {} selectable folders still need message counts from IMAP.",
+            snapshot.selectable_folders_missing_counts
+        ));
     } else if snapshot.needs_full_sync_backfill() {
         details.push(format!(
             "- Sync: only {} emails are indexed, but the largest known folder reports {} messages.",
@@ -766,6 +772,7 @@ impl AgentHarness {
             "requested_work": core_work_type_names(requested_work),
             "request_work_enabled": self.db_completeness.request_work,
             "folder_count": snapshot.folder_count,
+            "selectable_folders_missing_counts": snapshot.selectable_folders_missing_counts,
             "email_count": snapshot.email_count,
             "largest_folder_message_count": snapshot.largest_folder_message_count,
             "missing_message_id": snapshot.missing_message_id,
@@ -811,6 +818,7 @@ impl AgentHarness {
                 "task_id": task_id,
                 "snapshot": {
                     "folder_count": snapshot.folder_count,
+                    "selectable_folders_missing_counts": snapshot.selectable_folders_missing_counts,
                     "email_count": snapshot.email_count,
                     "largest_folder_message_count": snapshot.largest_folder_message_count,
                     "missing_message_id": snapshot.missing_message_id,
@@ -1079,11 +1087,12 @@ impl AgentHarness {
                 )
                 .await;
                 bail!(
-                    "db completeness wait timed out after {}s for task={} (requested_work={:?}, folder_count={}, email_count={}, largest_folder_message_count={}, missing_message_id={}, body_missing={}, analysis_missing={}, location_missing={}, body_sync pending/failed/processing/dead={}/{}/{}/{})",
+                    "db completeness wait timed out after {}s for task={} (requested_work={:?}, folder_count={}, selectable_folders_missing_counts={}, email_count={}, largest_folder_message_count={}, missing_message_id={}, body_missing={}, analysis_missing={}, location_missing={}, body_sync pending/failed/processing/dead={}/{}/{}/{})",
                     pending.max_wait.as_secs(),
                     task_id,
                     core_work_type_names(&pending.requested_work),
                     pending.snapshot.folder_count,
+                    pending.snapshot.selectable_folders_missing_counts,
                     pending.snapshot.email_count,
                     pending.snapshot.largest_folder_message_count,
                     pending.snapshot.missing_message_id,
@@ -1108,13 +1117,14 @@ impl AgentHarness {
             )
             .await;
             log::info!(
-                "[harness] waiting for db completeness task={} account={} stable={}/{} requested_work={:?} folder_count={} email_count={} largest_folder_message_count={} missing_message_id={} body_missing={} analysis_missing={} location_missing={} body_sync pending/failed/processing={}/{}/{} sleep_ms={}",
+                "[harness] waiting for db completeness task={} account={} stable={}/{} requested_work={:?} folder_count={} selectable_folders_missing_counts={} email_count={} largest_folder_message_count={} missing_message_id={} body_missing={} analysis_missing={} location_missing={} body_sync pending/failed/processing={}/{}/{} sleep_ms={}",
                 task_id,
                 self.account_id,
                 stable_polls,
                 self.db_completeness.stable_polls_required,
                 core_work_type_names(&requested_work),
                 snapshot.folder_count,
+                snapshot.selectable_folders_missing_counts,
                 snapshot.email_count,
                 snapshot.largest_folder_message_count,
                 snapshot.missing_message_id,
@@ -2515,6 +2525,7 @@ mod tests {
     fn ready_db_snapshot() -> DbCompletenessSnapshot {
         DbCompletenessSnapshot {
             folder_count: 4,
+            selectable_folders_missing_counts: 0,
             largest_folder_message_count: 42,
             email_count: 42,
             missing_message_id: 0,
@@ -2551,6 +2562,22 @@ mod tests {
         };
 
         assert!(classify_db_prerequisite_work(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn test_classify_db_prerequisite_work_requires_observed_folder_counts() {
+        let snapshot = DbCompletenessSnapshot {
+            folder_count: 6,
+            selectable_folders_missing_counts: 2,
+            largest_folder_message_count: 0,
+            email_count: 0,
+            ..ready_db_snapshot()
+        };
+
+        assert_eq!(
+            classify_db_prerequisite_work(&snapshot),
+            vec![CoreWorkType::SyncFull]
+        );
     }
 
     #[test]

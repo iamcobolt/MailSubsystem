@@ -7,6 +7,7 @@ use crate::db::{BodySyncQueueDepth, Database};
 #[derive(Debug, Clone, Default)]
 pub struct DbCompletenessSnapshot {
     pub folder_count: i64,
+    pub selectable_folders_missing_counts: i64,
     pub largest_folder_message_count: i64,
     pub email_count: i64,
     pub missing_message_id: i64,
@@ -21,6 +22,7 @@ pub struct DbCompletenessSnapshot {
 impl DbCompletenessSnapshot {
     pub fn needs_full_sync_backfill(&self) -> bool {
         self.folder_count == 0
+            || self.selectable_folders_missing_counts > 0
             || (self.email_count == 0 && self.largest_folder_message_count > 0)
             || (self.largest_folder_message_count >= 100
                 && self.email_count.saturating_mul(4) < self.largest_folder_message_count)
@@ -54,6 +56,7 @@ impl Database {
             r#"
             SELECT
               (SELECT COUNT(*) FROM imap_folders WHERE account_id = $1) AS folder_count,
+              (SELECT COUNT(*) FROM imap_folders WHERE account_id = $1 AND is_noselect = FALSE AND message_count IS NULL) AS selectable_folders_missing_counts,
               (SELECT COALESCE(MAX(message_count), 0)::bigint FROM imap_folders WHERE account_id = $1 AND is_noselect = FALSE) AS largest_folder_message_count,
               (SELECT COUNT(*) FROM emails WHERE account_id = $1) AS email_count,
               (SELECT COUNT(*) FROM emails_missing_message_id WHERE account_id = $1) AS missing_message_id,
@@ -75,6 +78,8 @@ impl Database {
 
         Ok(DbCompletenessSnapshot {
             folder_count: row.get::<i64, _>("folder_count"),
+            selectable_folders_missing_counts: row
+                .get::<i64, _>("selectable_folders_missing_counts"),
             largest_folder_message_count: row.get::<i64, _>("largest_folder_message_count"),
             email_count: row.get::<i64, _>("email_count"),
             missing_message_id: row.get::<i64, _>("missing_message_id"),
