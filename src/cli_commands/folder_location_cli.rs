@@ -24,7 +24,7 @@ fn normalize_folder_path(path: &str, delimiter: &str) -> String {
             if policy == "preserve" {
                 sanitized
             } else {
-                to_title_case(&sanitized)
+                canonical_folder_segment_casing(&to_title_case(&sanitized))
             }
         })
         .filter(|segment| !segment.is_empty())
@@ -101,6 +101,15 @@ fn to_title_case(s: &str) -> String {
         }
     }
     result
+}
+
+fn canonical_folder_segment_casing(segment: &str) -> String {
+    match segment.to_ascii_lowercase().as_str() {
+        "github" => "GitHub".to_string(),
+        "linkedin" => "LinkedIn".to_string(),
+        "otp" => "OTP".to_string(),
+        _ => segment.to_string(),
+    }
 }
 
 fn effective_provider_name(config: &ai::AIConfig) -> String {
@@ -952,7 +961,7 @@ mod tests {
         );
         assert_eq!(
             canonicalize_location_folder_path("Security/OTP", "/"),
-            "Personal/Security/Otp"
+            "Personal/Security/OTP"
         );
         assert_eq!(
             canonicalize_location_folder_path("Personal/Security", "/"),
@@ -989,6 +998,14 @@ mod tests {
         assert_eq!(
             canonicalize_location_folder_path("Work/Primer Labs Inc.", "/"),
             "Work/Primer Labs Inc"
+        );
+        assert_eq!(
+            canonicalize_location_folder_path("Social/linkedin", "/"),
+            "Social/LinkedIn"
+        );
+        assert_eq!(
+            canonicalize_location_folder_path("Work/Dev/github", "/"),
+            "Work/Dev/GitHub"
         );
     }
 

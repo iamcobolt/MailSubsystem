@@ -47,6 +47,7 @@ fn serialize_similar_results(results: &[SimilarEmailResult]) -> String {
                 "message_id": r.message_id,
                 "subject": r.subject,
                 "sender": r.sender,
+                "location": r.location,
                 "human_summary": r.human_summary,
                 "organization": r.organization,
                 "list_id": r.list_id,
@@ -445,6 +446,7 @@ mod tests {
             message_id: id.to_string(),
             subject: None,
             sender: None,
+            location: None,
             human_summary: None,
             organization: None,
             list_id: None,
@@ -483,6 +485,17 @@ mod tests {
         let fused = fuse_hybrid_results(Vec::new(), lexical, 1);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].message_id, "x");
+    }
+
+    #[test]
+    fn serialize_similar_results_includes_location() {
+        let mut result = sample_result("x", 0.10);
+        result.location = Some("Work/LinkedIn".to_string());
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&serialize_similar_results(&[result])).expect("json payload");
+
+        assert_eq!(payload[0]["location"], "Work/LinkedIn");
     }
 
     #[tokio::test]
