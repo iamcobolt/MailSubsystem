@@ -278,6 +278,42 @@ AI_PROVIDER=openai
 OPENAI_API_KEY=sk-your-key-here
 ```
 
+### Alternative: Codex subscription
+
+If you have access to Codex through your ChatGPT plan and want to avoid using an
+OpenAI API key for MailSubsystem LLM calls, sign in to the local Codex CLI first:
+
+```bash
+codex login
+```
+
+MailSubsystem checks `codex login status` before each Codex-backed request. If
+the CLI is not logged in, it will stop with instructions to run `codex login` or
+`codex login --device-auth` for headless environments.
+
+Then configure MailSubsystem to use the Codex CLI provider:
+
+```env
+AI_PROVIDER=codex
+CODEX_BIN=codex
+CODEX_SANDBOX=read-only
+CODEX_TIMEOUT_SECS=300
+```
+
+For hybrid local/frontier routing, use your local model for routine work and Codex
+as the frontier provider:
+
+```env
+AI_PROVIDER=hybrid
+LOCAL_LLM_URL=http://localhost:1234/v1
+LOCAL_LLM_MODEL=your-model-name
+FRONTIER_PROVIDER=codex
+```
+
+This adapter runs `codex exec` as a subprocess using your signed-in Codex client.
+It does not require `OPENAI_API_KEY`, but it is slower than direct API calls and
+counts against your Codex plan limits or Codex credits.
+
 ### Alternative: Anthropic (Claude)
 
 1. Go to [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
