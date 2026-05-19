@@ -143,6 +143,10 @@ impl EmbeddingProvider for RateLimitedEmbeddingProvider {
         self.inner.model_name()
     }
 
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {

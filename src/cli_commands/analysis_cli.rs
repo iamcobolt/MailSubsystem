@@ -943,7 +943,7 @@ pub async fn run_embed_backfill_for_account(limit: usize, account_id: &str) -> a
         .await
         .context("Embedding provider required for embed-backfill")?;
     embeddings::validate_embedding_model(&db, embedder.as_ref()).await?;
-    let rpm = if std::env::var("LOCAL_LLM_URL").is_ok() {
+    let rpm = if embedder.is_local() {
         None
     } else {
         ai_config.rate_limit_for_provider("gemini")
@@ -1010,6 +1010,9 @@ async fn embed_backfill_loop(
         started.elapsed().as_secs_f64(),
         &[],
     );
+
+    let _model_lock = db.acquire_embedding_model_shared_lock().await?;
+    embeddings::assert_embedding_model_current(db, embedder.as_ref()).await?;
 
     let mut done = 0;
     let mut failed = 0;
@@ -1116,24 +1119,31 @@ pub async fn run_embed_rebuild_for_account(limit: usize, account_id: &str) -> an
         dims
     );
 
-    // Step 1: Null all existing embeddings
-    let nulled = db.null_all_embeddings_for_account(account_id).await?;
-    println!("Nulled {} existing embedding(s).", nulled);
+    {
+        let _lock = db.acquire_embedding_model_lock().await?;
 
-    // Step 2: Rebuild HNSW index
-    println!("Rebuilding HNSW index...");
-    db.rebuild_embedding_index(dims).await?;
-    println!("Index rebuilt.");
+        // Step 1: Null all existing embeddings
+        let nulled = db.null_all_embeddings().await?;
+        println!(
+            "Nulled {} existing embedding(s) across all accounts.",
+            nulled
+        );
 
-    // Step 3: Store new model metadata
-    db.set_system_metadata("embedding_model", &model).await?;
-    db.set_system_metadata("embedding_dimensions", &dims.to_string())
-        .await?;
-    println!("Stored new embedding model metadata.");
+        // Step 2: Rebuild HNSW index
+        println!("Rebuilding HNSW index...");
+        db.rebuild_embedding_index(dims).await?;
+        println!("Index rebuilt.");
+
+        // Step 3: Store new model metadata
+        db.set_system_metadata("embedding_model", &model).await?;
+        db.set_system_metadata("embedding_dimensions", &dims.to_string())
+            .await?;
+        println!("Stored new embedding model metadata.");
+    }
 
     // Step 4: Backfill with the new model
     println!("Starting backfill with limit {}...", limit);
-    let rpm = if std::env::var("LOCAL_LLM_URL").is_ok() {
+    let rpm = if embedder.is_local() {
         None
     } else {
         ai_config.rate_limit_for_provider("gemini")

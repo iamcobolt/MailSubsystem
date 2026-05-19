@@ -306,6 +306,11 @@ increase `LOCAL_LLM_CONCURRENCY`, or set `ANALYZE_CONCURRENCY` /
 `LOCATE_CONCURRENCY` separately, if your local server and GPU can handle more
 parallel requests.
 
+If you use a local model for analysis but want frontier embeddings for RAG,
+set `EMBEDDING_PROVIDER=gemini` and keep `GEMINI_API_KEY` or
+`EMBEDDING_API_KEY` configured. For local embeddings, set `EMBEDDING_MODEL` to
+an embedding model that is actually installed on your local model server.
+
 ### Cost awareness
 
 Each email analysis is usually one LLM API call. Costs and rate limits change, so check your provider's current pricing before processing a large mailbox.

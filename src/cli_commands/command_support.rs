@@ -18,8 +18,8 @@ pub async fn create_rag_builder(
     let embedder = embeddings::create_embedding_provider().await?;
     embeddings::validate_embedding_model(&database, embedder.as_ref()).await?;
     let rpm = ai_config.and_then(|cfg| {
-        if std::env::var("LOCAL_LLM_URL").is_ok() {
-            None // local embeddings — no rate limit
+        if embedder.is_local() {
+            None
         } else {
             cfg.rate_limit_for_provider("gemini")
         }
