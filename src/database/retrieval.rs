@@ -723,20 +723,8 @@ impl Database {
             let body_text: Option<String> = r.get("body_text");
             let raw_email_content: Option<String> = r.get("raw_email_content");
 
-            let body_source = if let Some(ref b) = body_text {
-                let t = b.trim();
-                if !t.is_empty() {
-                    t.to_string()
-                } else {
-                    extract_body_from_raw(raw_email_content.as_deref())
-                }
-            } else {
-                extract_body_from_raw(raw_email_content.as_deref())
-            };
-            let cleaned_body = clean_email_body_text(&body_source, 24_000);
-            if cleaned_body.is_empty() {
-                continue;
-            }
+            let cleaned_body =
+                clean_body_for_embedding(body_text.as_deref(), raw_email_content.as_deref());
             let text = build_canonical_embedding_text(&CanonicalEmbeddingTextInput {
                 subject: subject.as_deref(),
                 sender: sender.as_deref(),
@@ -775,6 +763,26 @@ fn extract_body_from_raw(raw: Option<&str>) -> String {
         Err(_) => return String::new(),
     };
     extract_body_from_parsed(&parsed).unwrap_or_default()
+}
+
+fn clean_body_for_embedding(body_text: Option<&str>, raw_email_content: Option<&str>) -> String {
+    let body_source = if let Some(body) = body_text {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            extract_body_from_raw(raw_email_content)
+        }
+    } else {
+        extract_body_from_raw(raw_email_content)
+    };
+
+    let cleaned = clean_email_body_text(&body_source, 24_000);
+    if cleaned.is_empty() {
+        clean_email_body_text(raw_email_content.or(body_text).unwrap_or_default(), 24_000)
+    } else {
+        cleaned
+    }
 }
 
 fn extract_body_from_parsed(parsed: &ParsedMail) -> Option<String> {
@@ -877,7 +885,9 @@ fn build_canonical_embedding_text(input: &CanonicalEmbeddingTextInput<'_>) -> St
     if let Some(v) = normalized_nonempty(input.human_summary) {
         sections.push(format!("summary: {}", clean_email_body_text(v, 800)));
     }
-    sections.push(format!("body: {}", input.body_clean));
+    if let Some(v) = normalized_nonempty(Some(input.body_clean)) {
+        sections.push(format!("body: {}", v));
+    }
     sections.join("\n")
 }
 
@@ -1247,5 +1257,47 @@ impl Database {
                 distance: r.get::<f64, _>("distance"),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_canonical_embedding_text, clean_body_for_embedding, CanonicalEmbeddingTextInput,
+    };
+
+    #[test]
+    fn clean_body_for_embedding_falls_back_to_raw_when_parsed_body_is_empty() {
+        let raw = "X-Broken: true\r\n\r\n".repeat(12);
+
+        let cleaned = clean_body_for_embedding(Some("   "), Some(&raw));
+
+        assert!(!cleaned.is_empty());
+        assert!(cleaned.contains("X-Broken"));
+    }
+
+    #[test]
+    fn canonical_embedding_text_keeps_metadata_without_body() {
+        let text = build_canonical_embedding_text(&CanonicalEmbeddingTextInput {
+            subject: Some("Delivery update"),
+            sender: Some("sender@example.com"),
+            human_summary: None,
+            category: None,
+            subcategory: None,
+            organization: None,
+            topic: None,
+            email_type: None,
+            otp_status: None,
+            list_id: None,
+            list_unsubscribe: None,
+            x_priority: None,
+            return_path: None,
+            reply_to: None,
+            body_clean: "",
+        });
+
+        assert!(text.contains("subject: Delivery update"));
+        assert!(text.contains("sender_domain: example.com"));
+        assert!(!text.contains("body:"));
     }
 }
