@@ -240,20 +240,17 @@ fn infer_otp_status_defaults_to_not_otp_when_missing() {
 }
 
 #[test]
-fn infer_otp_status_detects_password_reset_from_summary() {
+fn infer_otp_status_uses_model_provided_subtype() {
     let r = AnalysisResult {
-        human_summary: Some(
-            "Use this verification code to reset your password before it expires.".to_string(),
-        ),
+        otp_status: Some("password_reset".to_string()),
         ..AnalysisResult::default()
     };
     assert_eq!(infer_otp_status_from_result(&r), "password_reset");
 }
 
 #[test]
-fn infer_otp_status_prefers_magic_link_evidence_over_model_otp() {
+fn infer_otp_status_does_not_guess_from_summary_keywords() {
     let r = AnalysisResult {
-        otp_status: Some("otp".to_string()),
         topic: Some("Secure link to log in".to_string()),
         human_summary: Some(
             "Magic link email for signing in to the console, with no one-time code.".to_string(),
@@ -261,187 +258,33 @@ fn infer_otp_status_prefers_magic_link_evidence_over_model_otp() {
         ..AnalysisResult::default()
     };
 
-    assert_eq!(infer_otp_status_from_result(&r), "magic_link");
+    assert_eq!(infer_otp_status_from_result(&r), "not_otp");
 }
 
 #[test]
-fn infer_otp_status_keeps_code_based_otp() {
-    let r = AnalysisResult {
-        otp_status: Some("otp".to_string()),
-        human_summary: Some(
-            "A one-time SecurPass verification code was issued and expires in 10 minutes."
-                .to_string(),
-        ),
-        ..AnalysisResult::default()
-    };
-
-    assert_eq!(infer_otp_status_from_result(&r), "otp");
-}
-
-#[test]
-fn useful_admin_guidance_verifier_matches_property_compliance_newsletter() {
-    let r = AnalysisResult {
-            spam_status: Some("spam".to_string()),
-            phishing_status: Some("not-phishing".to_string()),
-            marketing_status: Some("marketing".to_string()),
-            category: Some("personal".to_string()),
-            subcategory: Some("property_management".to_string()),
-            email_type: Some("newsletter".to_string()),
-            topic: Some("2026 landlord compliance deadlines".to_string()),
-            human_summary: Some(
-                "Landlord newsletter explaining regulatory changes, safety certificate renewals, tenancy law updates, and tax filing obligations with secondary service links."
-                    .to_string(),
-            ),
-            ..AnalysisResult::default()
-        };
-
-    assert!(indicates_recipient_useful_admin_guidance(&r));
-}
-
-#[test]
-fn useful_admin_guidance_verifier_ignores_retail_deal_newsletter() {
-    let r = AnalysisResult {
-        spam_status: Some("spam".to_string()),
+fn classification_reflection_triggers_on_consequential_or_uncertain_results() {
+    let clear_safe = AnalysisResult {
+        spam_status: Some("not-spam".to_string()),
         phishing_status: Some("not-phishing".to_string()),
-        marketing_status: Some("marketing".to_string()),
-        category: Some("shopping".to_string()),
-        subcategory: Some("retail_promotions".to_string()),
-        email_type: Some("newsletter".to_string()),
-        topic: Some("limited time sale".to_string()),
-        human_summary: Some(
-            "Retail newsletter advertising discounts, coupon codes, and shop-now links."
-                .to_string(),
-        ),
+        marketing_status: Some("not-marketing".to_string()),
+        otp_status: Some("not_otp".to_string()),
+        threat_level: Some("none".to_string()),
+        confidence: Some(0.96),
         ..AnalysisResult::default()
     };
+    assert!(!needs_classification_reflection(&clear_safe));
 
-    assert!(!indicates_recipient_useful_admin_guidance(&r));
-}
-
-#[test]
-fn user_configured_alert_verifier_matches_saved_search_alert() {
-    let r = AnalysisResult {
-            spam_status: Some("spam".to_string()),
-            phishing_status: Some("not-phishing".to_string()),
-            marketing_status: Some("marketing".to_string()),
-            category: Some("shopping".to_string()),
-            subcategory: Some("saved_search_alert".to_string()),
-            email_type: Some("newsletter".to_string()),
-            topic: Some("raincoat saved search".to_string()),
-            human_summary: Some(
-                "Marketplace alert notifying the user that new items match their saved search criteria."
-                    .to_string(),
-            ),
-            ..AnalysisResult::default()
-        };
-
-    assert!(indicates_user_configured_alert(&r));
-}
-
-#[test]
-fn user_configured_alert_verifier_ignores_generic_retail_promo() {
-    let r = AnalysisResult {
+    let spam = AnalysisResult {
         spam_status: Some("spam".to_string()),
-        phishing_status: Some("not-phishing".to_string()),
-        marketing_status: Some("marketing".to_string()),
-        category: Some("shopping".to_string()),
-        subcategory: Some("retail_promotions".to_string()),
-        email_type: Some("newsletter".to_string()),
-        topic: Some("weekly sale alert".to_string()),
-        human_summary: Some(
-            "Retail newsletter advertising coupon codes, discounts, and shop-now links."
-                .to_string(),
-        ),
-        ..AnalysisResult::default()
+        ..clear_safe.clone()
     };
+    assert!(needs_classification_reflection(&spam));
 
-    assert!(!indicates_user_configured_alert(&r));
-}
-
-#[test]
-fn source_evidence_verifier_matches_saved_search_footer() {
-    let mut email = sample_email();
-    email.subject = Some("raincoat: 15 new matches".to_string());
-    email.body_text = Some(
-        "Want to turn off this email? Manage search alerts or unsave a search in account settings."
-            .to_string(),
-    );
-
-    assert!(email_evidence_indicates_user_configured_alert(&email));
-}
-
-#[test]
-fn source_evidence_verifier_ignores_generic_preference_footer() {
-    let mut email = sample_email();
-    email.subject = Some("Weekly sale alert".to_string());
-    email.body_text = Some(
-        "Retail newsletter advertising coupon codes. Update your email preferences.".to_string(),
-    );
-
-    assert!(!email_evidence_indicates_user_configured_alert(&email));
-}
-
-#[test]
-fn source_evidence_verifier_ignores_non_alert_watch_list_language() {
-    let mut email = sample_email();
-    email.subject = Some("What landlords should prepare for in 2026".to_string());
-    email.body_text = Some(
-            "A landlord compliance guide with a regulatory watch list, service links, and email preferences."
-                .to_string(),
-        );
-
-    assert!(!email_evidence_indicates_user_configured_alert(&email));
-}
-
-#[test]
-fn user_configured_alert_summary_detail_adds_alert_basis() {
-    let mut r = AnalysisResult {
-        ai_summary: Some(Value::String(
-            "Marketplace email showing 15 new raincoat listings with prices.".to_string(),
-        )),
-        human_summary: Some(
-            "The marketplace is showing 15 new raincoat listings matching the saved search."
-                .to_string(),
-        ),
-        ..AnalysisResult::default()
+    let uncertain = AnalysisResult {
+        confidence: Some(0.82),
+        ..clear_safe
     };
-
-    ensure_user_configured_alert_summary_detail(&mut r);
-
-    assert!(r
-        .human_summary
-        .as_deref()
-        .is_some_and(|summary| summary.contains("saved search")));
-    assert!(r
-        .ai_summary
-        .as_ref()
-        .is_some_and(|summary| summary.to_string().contains("Source evidence")));
-}
-
-#[test]
-fn user_configured_alert_summary_detail_does_not_duplicate_alert_basis() {
-    let mut r = AnalysisResult {
-        ai_summary: Some(Value::String(
-            "The marketplace sent a saved search alert for raincoat listings.".to_string(),
-        )),
-        human_summary: Some(
-            "The marketplace found listings matching your saved search.".to_string(),
-        ),
-        ..AnalysisResult::default()
-    };
-
-    ensure_user_configured_alert_summary_detail(&mut r);
-
-    assert_eq!(
-        r.human_summary.as_deref(),
-        Some("The marketplace found listings matching your saved search.")
-    );
-    assert_eq!(
-        r.ai_summary.as_ref(),
-        Some(&Value::String(
-            "The marketplace sent a saved search alert for raincoat listings.".to_string()
-        ))
-    );
+    assert!(needs_classification_reflection(&uncertain));
 }
 
 #[test]
@@ -500,6 +343,41 @@ fn email_analyzer_agent_prompt_shares_user_configured_alert_policy() {
         &spec,
         "User-configured alerts, preference-based notifications",
     );
+}
+
+#[test]
+fn email_analyzer_agent_prompt_keeps_classification_out_of_keyword_filters() {
+    let spec = email_analyzer_composed_prompt();
+
+    assert_prompt_contains(
+        &spec,
+        "Classification decisions must come from contextual analysis",
+    );
+    assert_prompt_contains(&spec, "not deterministic keyword filters");
+    assert_prompt_contains(&spec, "must not flip");
+    assert_prompt_contains(&spec, "hard-coded word or phrase");
+}
+
+#[test]
+fn email_analyzer_agent_prompt_shares_fraud_education_policy() {
+    let spec = email_analyzer_composed_prompt();
+
+    assert_prompt_contains(
+        &spec,
+        "Do not classify a message as phishing merely because",
+    );
+    assert_prompt_contains(&spec, "legitimate newsletter");
+    assert_prompt_contains(&spec, "fraud prevention");
+}
+
+#[test]
+fn email_analyzer_agent_prompt_shares_hide_my_email_delivery_policy() {
+    let spec = email_analyzer_composed_prompt();
+
+    assert_prompt_contains(&spec, "Apple Hide My Email rewriting is not spoofing");
+    assert_prompt_contains(&spec, "X-ICLOUD-HME");
+    assert_prompt_contains(&spec, "Narvar");
+    assert_prompt_contains(&spec, "concrete order/tracking details");
 }
 
 #[test]
@@ -856,6 +734,109 @@ async fn test_analyze_runs_schema_alignment_repair_for_generic_personal() {
     assert!(prompts[0].contains("current value is plausible by meaning"));
     assert!(prompts[0].contains("If multiple values are plausible"));
     assert!(prompts[0].contains("create/preserve that specific element in subcategory"));
+}
+
+#[tokio::test]
+async fn classification_reflection_reviews_and_merges_corrected_statuses() {
+    let responses = Arc::new(Mutex::new(VecDeque::from(vec![
+        r#"{
+            "spam_status":"not-spam",
+            "phishing_status":"not-phishing",
+            "marketing_status":"not-marketing",
+            "otp_status":"not_otp",
+            "threat_level":"none",
+            "category":"shopping",
+            "subcategory":"delivery_status",
+            "email_type":"transactional",
+            "organization":"lululemon",
+            "topic":"Missed delivery attempt for an existing order",
+            "ai_summary":"The reflection found authenticated transactional delivery evidence rather than concrete phishing behavior. The message includes order and tracking context, and the suspicious-looking alias should be evaluated with header alignment rather than treated as spoofing by itself. Final classification: not spam, not phishing, not marketing, not_otp.",
+            "human_summary":"lululemon sent a transactional missed-delivery notice for an order. No phishing behavior is confirmed from the provided evidence.",
+            "threat_indicators":[],
+            "spam_confidence":0.91,
+            "phishing_confidence":0.90,
+            "marketing_confidence":0.92,
+            "category_confidence":0.90
+        }"#
+        .to_string(),
+    ])));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn ai::AIProvider> = Arc::new(SequenceJsonProvider {
+        responses,
+        prompts: prompts.clone(),
+    });
+    let analyzer = EmailAnalyzer::new(None, provider, failing_rag_builder());
+    let mut email = sample_email();
+    email.subject = Some("Missed delivery attempt.".to_string());
+    email.sender = Some("customercare@lululemon.narvar.com".to_string());
+    email.body_text = Some(
+        "There was an attempt to deliver your order. Track my order for updated courier information."
+            .to_string(),
+    );
+    let result = AnalysisResult {
+        spam_status: Some("spam".to_string()),
+        phishing_status: Some("phishing".to_string()),
+        marketing_status: Some("not-marketing".to_string()),
+        otp_status: Some("not_otp".to_string()),
+        threat_level: Some("high".to_string()),
+        category: Some("shopping".to_string()),
+        subcategory: Some("delivery_status".to_string()),
+        email_type: Some("notification".to_string()),
+        organization: Some("lululemon".to_string()),
+        topic: Some("Missed delivery attempt".to_string()),
+        confidence: Some(0.97),
+        analyzed_by: Some("orchestrator:test".to_string()),
+        ..AnalysisResult::default()
+    };
+
+    let result = analyzer
+        .reflect_classification_if_needed(&email, result)
+        .await;
+    let prompts = prompts.lock().expect("lock prompts");
+
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("classification reflection"));
+    assert!(prompts[0].contains("Review every classification dimension"));
+    assert_eq!(result.spam_status.as_deref(), Some("not-spam"));
+    assert_eq!(result.phishing_status.as_deref(), Some("not-phishing"));
+    assert_eq!(result.threat_level.as_deref(), Some("none"));
+    assert_eq!(result.email_type.as_deref(), Some("transactional"));
+    assert_eq!(result.confidence, Some(0.90));
+    assert!(result
+        .analyzed_by
+        .as_deref()
+        .is_some_and(|value| value.contains("+classification_reflection")));
+}
+
+#[tokio::test]
+async fn classification_reflection_skips_clear_safe_high_confidence_results() {
+    let responses = Arc::new(Mutex::new(VecDeque::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn ai::AIProvider> = Arc::new(SequenceJsonProvider {
+        responses,
+        prompts: prompts.clone(),
+    });
+    let analyzer = EmailAnalyzer::new(None, provider, failing_rag_builder());
+    let email = sample_email();
+    let result = AnalysisResult {
+        spam_status: Some("not-spam".to_string()),
+        phishing_status: Some("not-phishing".to_string()),
+        marketing_status: Some("not-marketing".to_string()),
+        otp_status: Some("not_otp".to_string()),
+        threat_level: Some("none".to_string()),
+        category: Some("financial".to_string()),
+        email_type: Some("transactional".to_string()),
+        confidence: Some(0.96),
+        ..AnalysisResult::default()
+    };
+
+    let result = analyzer
+        .reflect_classification_if_needed(&email, result)
+        .await;
+
+    assert_eq!(prompts.lock().expect("lock prompts").len(), 0);
+    assert_eq!(result.spam_status.as_deref(), Some("not-spam"));
+    assert_eq!(result.phishing_status.as_deref(), Some("not-phishing"));
 }
 
 /// Live-data test: run full analysis on one record when TEST_MESSAGE_ID and DATABASE_URL are set.

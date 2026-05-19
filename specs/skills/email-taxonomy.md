@@ -23,6 +23,21 @@ email-analyzer agent, classification workers, and the Rust analysis pipeline.
 - Keep spam, phishing, marketing, OTP/security, category, organization, and
   email type decisions separate.
 
+## Implementation Boundary
+
+- Classification decisions must come from contextual analysis of the email and
+  account evidence, not deterministic keyword filters in normalization code.
+- Deterministic code may canonicalize enum spelling, preserve schema-safe
+  labels, trigger an LLM schema-alignment review for broad or invalid taxonomy
+  values, and trigger an LLM classification reflection for consequential or
+  low-confidence outcomes. It must not flip `spam_status`, `phishing_status`,
+  `marketing_status`, `otp_status`, summaries, or message type because a subject,
+  body, sender, or footer contains a hard-coded word or phrase.
+- Borderline cases such as recipient-useful newsletters, user-configured alerts,
+  signature-only marketing, educational fraud content, Hide My Email aliases,
+  and delivery lures should be resolved by the model using full context and
+  evidence-backed reasoning.
+
 ## Classification Policy
 
 Treat `spam_status`, `phishing_status`, and `marketing_status` as independent
@@ -112,6 +127,11 @@ flags; more than one may apply.
 - For scam/fraud coercion such as fake compromise claims, fake breach claims,
   Bitcoin/crypto payment demands, or credential harvesting, classify as
   phishing. If also bulk or unsolicited, spam may also apply.
+- Do not classify a message as phishing merely because a legitimate newsletter,
+  guide, or educational article discusses fraud, identity theft, scams, or fraud
+  prevention. Require actual malicious/deceptive behavior such as credential
+  collection, payment redirection, malware, impersonation, coercive fake
+  compromise/breach claims, or suspicious links or attachments.
 - If uncertain for a purely promotional newsletter in commerce, travel, events,
   software, services, or marketplace categories, choose `spam`.
 - If uncertain for account, educational, property/landlord, legal, tax, safety,
