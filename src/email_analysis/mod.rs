@@ -12,7 +12,7 @@ use crate::harness::{
     build_analysis_tools, build_orchestrator_tools, resolve_provider, AgentHarness, AgentSpec,
     RunResult,
 };
-use crate::rag::RAGContextBuilder;
+use crate::rag::{RAGContextBuilder, SimilarSearchHints};
 
 mod harness_io;
 mod result_normalization;
@@ -26,7 +26,8 @@ use harness_io::{
     orchestrator_output_to_analysis_result, truncate_str,
 };
 use result_normalization::{
-    apply_schema_alignment_result, needs_schema_alignment_review, CATEGORY_ALLOWED,
+    apply_classification_reflection_result, apply_schema_alignment_result,
+    needs_classification_reflection, needs_schema_alignment_review, CATEGORY_ALLOWED,
     EMAIL_TYPE_ALLOWED,
 };
 
@@ -125,7 +126,8 @@ impl EmailAnalyzer {
         worker_instruction: Option<&str>,
     ) -> Result<AnalysisResult> {
         let result = self.analyze_with_harness(email, worker_instruction).await?;
-        Ok(self.repair_schema_alignment(email, result).await)
+        let result = self.repair_schema_alignment(email, result).await;
+        Ok(self.reflect_classification_if_needed(email, result).await)
     }
 
     async fn analyze_with_harness(
@@ -391,7 +393,221 @@ impl EmailAnalyzer {
             )
             .await?;
         let analysis = harness_output_to_analysis_result(result, email)?;
-        Ok(self.repair_schema_alignment(email, analysis).await)
+        let analysis = self.repair_schema_alignment(email, analysis).await;
+        Ok(self.reflect_classification_if_needed(email, analysis).await)
+    }
+
+    async fn reflect_classification_if_needed(
+        &self,
+        email: &EmailRecord,
+        mut result: AnalysisResult,
+    ) -> AnalysisResult {
+        if !needs_classification_reflection(&result) {
+            return result;
+        }
+
+        let prompt = self
+            .build_classification_reflection_prompt(email, &result)
+            .await;
+        let response = match self
+            .frontier_provider
+            .complete(vec![Message::user(prompt)])
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log::warn!(
+                    "Classification reflection failed for {}: {}",
+                    email.message_id,
+                    error
+                );
+                return result;
+            }
+        };
+
+        let reflection = match ai::parse_analysis_response(&response.content, true) {
+            Ok(reflection) => reflection,
+            Err(error) => {
+                log::warn!(
+                    "Classification reflection returned invalid JSON for {}: {}",
+                    email.message_id,
+                    error
+                );
+                return result;
+            }
+        };
+
+        if apply_classification_reflection_result(&mut result, &reflection) {
+            log::debug!(
+                "Classification reflection reviewed {} to spam={:?}, phishing={:?}, marketing={:?}, otp={:?}, threat={:?}, category={:?}, email_type={:?}",
+                email.message_id,
+                result.spam_status,
+                result.phishing_status,
+                result.marketing_status,
+                result.otp_status,
+                result.threat_level,
+                result.category,
+                result.email_type
+            );
+        }
+        result
+    }
+
+    async fn build_classification_reflection_prompt(
+        &self,
+        email: &EmailRecord,
+        result: &AnalysisResult,
+    ) -> String {
+        let analysis_json =
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_string());
+        let body = email
+            .body_text
+            .as_deref()
+            .or(email.raw_email_content.as_deref())
+            .unwrap_or("");
+        let body_excerpt = truncate_str(body, 8_000);
+        let raw_excerpt = email
+            .raw_email_content
+            .as_deref()
+            .map(|raw| truncate_str(raw, 8_000))
+            .unwrap_or("");
+        let context = self
+            .build_classification_reflection_context(email, result)
+            .await;
+        let context_json =
+            serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string());
+        let allowed_categories = CATEGORY_ALLOWED.join(", ");
+        let allowed_email_types = EMAIL_TYPE_ALLOWED.join(", ");
+
+        format!(
+            r#"You are doing a classification reflection for MailSubsystem.
+
+Purpose:
+- Review the current email analysis for contextual mistakes before mailbox actions run.
+- This is not a keyword filter. Use full context: sender identity, authentication/header evidence, body intent, links/domains, thread/RAG history, current analysis rationale, and the recipient workflow.
+- Review every classification dimension: spam, phishing, marketing, OTP/auth flow, threat level, category, subcategory, email_type, summaries, organization, and topic.
+- Change a field only when the current analysis is contradicted by the evidence or misses important context. Otherwise keep the current value.
+
+Allowed categories: {allowed_categories}
+Allowed email_type values: {allowed_email_types}
+Allowed status values:
+- spam_status: spam | not-spam
+- phishing_status: phishing | not-phishing
+- marketing_status: marketing | not-marketing
+- otp_status: otp | magic_link | password_reset | not_otp
+- threat_level: none | low | medium | high | critical
+
+Reflection policy:
+- Do not classify educational or newsletter content as phishing merely because it discusses fraud, identity theft, scams, security, or prevention. Require actual deception, credential theft, payment redirection, malware, coercive fake compromise/breach claims, suspicious links, or unsafe attachments.
+- Apple Hide My Email aliases are not spoofing evidence by themselves. If `X-ICLOUD-HME` maps the alias to the claimed sender and DKIM/DMARC align for the service domain, treat that as context for legitimacy rather than random attacker infrastructure.
+- Delivery/order lures are phishing only when paired with suspicious domains, credential/payment collection, unexpected fees, malware, broken authentication/alignment, or other concrete malicious behavior. Authenticated order/tracking details are transactional evidence.
+- User-configured alerts, saved searches, watch lists, job alerts, account alerts, and preference-based notifications are not generic newsletters when the evidence says the recipient created or can manage that alert.
+- Marketing status describes the direct payload, not merely a static signature/footer. Signature-only promotion is not marketing; payload/direct-note promotion is marketing.
+- OTP/auth flows should be classified as otp, magic_link, or password_reset only when the message actually provides a one-time code, sign-in link, or password reset/recovery flow. Otherwise use not_otp.
+- If phishing_status is phishing, threat_level must be high or critical. If threat_level is high or critical but phishing_status is not-phishing, explain the non-phishing threat clearly.
+- Use confidence as your certainty across all dimensions. Include field-level confidences.
+
+Return exactly one JSON object, no markdown:
+{{
+  "spam_status": "...",
+  "phishing_status": "...",
+  "marketing_status": "...",
+  "otp_status": "...",
+  "threat_level": "...",
+  "category": "...",
+  "subcategory": "...",
+  "email_type": "...",
+  "organization": "...",
+  "topic": "...",
+  "ai_summary": "3-5 evidence-backed sentences explaining the final classification and any correction.",
+  "human_summary": "2 concise user-facing sentences with action/no-action status.",
+  "threat_indicators": [],
+  "spam_confidence": 0.0,
+  "phishing_confidence": 0.0,
+  "marketing_confidence": 0.0,
+  "category_confidence": 0.0
+}}
+
+Email evidence:
+Subject: {subject}
+From: {sender}
+Date: {date}
+Current folder/location: {location}
+Body excerpt:
+{body_excerpt}
+
+Top-level raw/header excerpt:
+{raw_excerpt}
+
+Account/RAG context:
+{context_json}
+
+Current analysis JSON:
+{analysis_json}
+"#,
+            subject = email.subject.as_deref().unwrap_or(""),
+            sender = email.sender.as_deref().unwrap_or(""),
+            date = email
+                .received_date
+                .map(|date| date.to_rfc3339())
+                .unwrap_or_default(),
+            location = email.location.as_deref().unwrap_or(""),
+        )
+    }
+
+    async fn build_classification_reflection_context(
+        &self,
+        email: &EmailRecord,
+        result: &AnalysisResult,
+    ) -> Value {
+        let query = [
+            email.subject.as_deref(),
+            email.sender.as_deref(),
+            result.organization.as_deref(),
+            result.topic.as_deref(),
+            result.human_summary.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+        let hints = SimilarSearchHints {
+            sender: email.sender.as_deref(),
+            category: result.category.as_deref(),
+            email_type: result.email_type.as_deref(),
+            organization: result.organization.as_deref(),
+            list_id: None,
+            exclude_message_id: Some(email.message_id.as_str()),
+        };
+
+        match self
+            .rag_builder
+            .build_initial_context(
+                &self.account_id,
+                &email.related_message_ids,
+                email.sender.as_deref(),
+                Some(query.as_str()),
+                hints,
+            )
+            .await
+        {
+            Ok(context) => json!({
+                "sender_history": context.sender_history,
+                "sender_intent_profile": context.sender_intent_profile,
+                "thread_summaries": context.thread_summaries,
+                "thread_raw_messages": context.thread_raw_messages,
+                "similar_emails": context.similar_emails,
+            }),
+            Err(error) => {
+                log::warn!(
+                    "Classification reflection context failed for {}: {}",
+                    email.message_id,
+                    error
+                );
+                json!({})
+            }
+        }
     }
 
     async fn repair_schema_alignment(
