@@ -1,6 +1,6 @@
 //! AI provider abstraction and hybrid routing (local vs frontier).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rig::completion::{
     AssistantContent as RigAssistantContent, CompletionModel as RigCompletionModel,
@@ -13,7 +13,13 @@ use rig::OneOrMany as RigOneOrMany;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use uuid::Uuid;
 
 /// Chat message for provider API.
 #[derive(Debug, Clone)]
@@ -360,12 +366,13 @@ impl AIConfig {
         let has_gemini = std::env::var("GEMINI_API_KEY").is_ok();
         let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
         let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
+        let has_codex = env_flag("CODEX_ENABLED");
         let has_any_frontier = has_gemini || has_openai || has_anthropic;
 
-        match (has_local, has_any_frontier) {
-            (true, true) => Ok("hybrid".to_string()),
-            (true, false) => Ok("local".to_string()),
-            (false, true) => {
+        match (has_local, has_any_frontier, has_codex) {
+            (true, true, _) => Ok("hybrid".to_string()),
+            (true, false, _) => Ok("local".to_string()),
+            (false, true, _) => {
                 if has_gemini {
                     Ok("gemini".to_string())
                 } else if has_openai {
@@ -374,10 +381,12 @@ impl AIConfig {
                     Ok("anthropic".to_string())
                 }
             }
-            (false, false) => {
+            (false, false, true) => Ok("codex".to_string()),
+            (false, false, false) => {
                 anyhow::bail!(
                     "No AI provider configured. Set LOCAL_LLM_URL for a local model, \
-                     or set an API key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)."
+                     set an API key (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY), \
+                     or set AI_PROVIDER=codex after logging in with `codex login`."
                 );
             }
         }
@@ -445,6 +454,7 @@ impl AIConfig {
             || provider == "local"
             || provider == "ollama"
             || provider == "omlx"
+            || provider == "codex"
         {
             return None;
         }
@@ -514,6 +524,7 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                 .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
             Ok(Box::new(AnthropicProvider::new(api_key, model)?))
         }
+        "codex" => Ok(Box::new(CodexCliProvider::from_env()?)),
         "hybrid" => {
             // For hybrid, create the frontier provider. If no API keys are set, fall back to local LLM as frontier (local-only).
             let frontier_name = config
@@ -556,6 +567,7 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                         None
                     }
                 }
+                "codex" => Some(Box::new(CodexCliProvider::from_env()?) as Box<dyn AIProvider>),
                 _ => None,
             };
             if let Some(provider) = frontier {
@@ -578,7 +590,7 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                 )?));
             }
             anyhow::bail!(
-                "AI_PROVIDER=hybrid requires either (1) FRONTIER_PROVIDER=gemini|openai|anthropic with the corresponding API key, or (2) LOCAL_LLM_ENABLED=true with local LLM running (no API keys needed)."
+                "AI_PROVIDER=hybrid requires either (1) FRONTIER_PROVIDER=gemini|openai|anthropic with the corresponding API key, (2) FRONTIER_PROVIDER=codex with `codex login`, or (3) LOCAL_LLM_ENABLED=true with local LLM running (no API keys needed)."
             )
         }
         _ => {
@@ -593,11 +605,17 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                 return Ok(Box::new(GeminiProvider::new(api_key, model)?));
             }
             anyhow::bail!(
-                "Unknown or unsupported AI_PROVIDER: {}. Set AI_PROVIDER=gemini|openai|anthropic|hybrid, and FRONTIER_PROVIDER + API key for hybrid.",
+                "Unknown or unsupported AI_PROVIDER: {}. Set AI_PROVIDER=gemini|openai|anthropic|codex|hybrid, and FRONTIER_PROVIDER + API key or codex for hybrid.",
                 config.provider
             )
         }
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Hybrid provider bundle used by harness-backed analysis.
@@ -982,6 +1000,219 @@ impl AIProvider for LMStudioProvider {
     }
 }
 
+/// OpenAI Codex CLI provider.
+///
+/// This uses the user's local `codex` login instead of an OpenAI API key. It is
+/// intentionally a subprocess adapter: Codex is not exposed as a normal API
+/// credential, but `codex exec` can run non-interactively under the signed-in
+/// ChatGPT/Codex account.
+pub struct CodexCliProvider {
+    bin: String,
+    model: Option<String>,
+    profile: Option<String>,
+    sandbox: String,
+    timeout: Duration,
+}
+
+impl CodexCliProvider {
+    pub fn from_env() -> Result<Self> {
+        let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        let model = std::env::var("CODEX_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let profile = std::env::var("CODEX_PROFILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let sandbox = std::env::var("CODEX_SANDBOX")
+            .unwrap_or_else(|_| "read-only".to_string())
+            .trim()
+            .to_string();
+        let timeout_secs = std::env::var("CODEX_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300)
+            .max(10);
+
+        Ok(Self {
+            bin,
+            model,
+            profile,
+            sandbox,
+            timeout: Duration::from_secs(timeout_secs),
+        })
+    }
+
+    fn render_prompt(&self, request: &AICompletionRequest) -> String {
+        let mut prompt = String::new();
+        prompt.push_str(
+            "You are acting as a pure completion backend for MailSubsystem.\n\
+             Do not inspect or modify local files. Do not run shell commands. \
+             Use only the conversation and tool schemas below.\n\
+             Return only the assistant message content requested by the latest user message. \
+             If the requested output is JSON, return only that JSON object.\n",
+        );
+
+        if !request.tools.is_empty() {
+            prompt.push_str(
+                "\nMailSubsystem tools are executed by the parent harness, not by Codex. \
+                 To call one, output exactly one JSON object in this shape and stop:\n\
+                 {\"action\":\"use_tool\",\"tool\":\"<tool_name>\",\"args\":{}}\n\n\
+                 Available MailSubsystem tools:\n",
+            );
+            for tool in &request.tools {
+                prompt.push_str(&format!(
+                    "- `{}`: {}\n  parameters: {}\n",
+                    tool.name, tool.description, tool.parameters
+                ));
+            }
+        }
+
+        prompt.push_str("\nConversation:\n");
+        for message in &request.messages {
+            prompt.push_str(&format!(
+                "\n<{}>\n{}\n</{}>\n",
+                message.role, message.content, message.role
+            ));
+        }
+
+        prompt
+    }
+
+    fn temp_output_path() -> PathBuf {
+        std::env::temp_dir().join(format!("mailsubsystem-codex-output-{}.txt", Uuid::new_v4()))
+    }
+
+    fn temp_work_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("mailsubsystem-codex-work-{}", Uuid::new_v4()))
+    }
+
+    async fn run_codex_exec(&self, prompt: &str) -> Result<String> {
+        let output_path = Self::temp_output_path();
+        let work_dir = Self::temp_work_dir();
+        std::fs::create_dir_all(&work_dir).context("create Codex CLI temp workdir")?;
+        let mut command = Command::new(&self.bin);
+        command
+            .arg("--ask-for-approval")
+            .arg("never")
+            .arg("exec")
+            .arg("--ephemeral")
+            .arg("--skip-git-repo-check")
+            .arg("--cd")
+            .arg(&work_dir)
+            .arg("--sandbox")
+            .arg(&self.sandbox)
+            .arg("--color")
+            .arg("never")
+            .arg("--output-last-message")
+            .arg(&output_path);
+
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(profile) = &self.profile {
+            command.arg("--profile").arg(profile);
+        }
+
+        command
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|err| {
+            anyhow!(
+                "failed to start Codex CLI provider with `{}`: {}. Run `codex login` and set CODEX_BIN if needed.",
+                self.bin,
+                err
+            )
+        })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open Codex CLI stdin"))?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .context("write Codex CLI prompt")?;
+        drop(stdin);
+
+        let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+            Ok(result) => result.context("wait for Codex CLI provider")?,
+            Err(_) => {
+                let _ = std::fs::remove_file(&output_path);
+                let _ = std::fs::remove_dir_all(&work_dir);
+                anyhow::bail!("Codex CLI provider timed out after {:?}", self.timeout);
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&output_path);
+            let _ = std::fs::remove_dir_all(&work_dir);
+            anyhow::bail!(
+                "Codex CLI provider failed with status {}. stderr: {} stdout: {}",
+                output.status,
+                stderr.trim(),
+                stdout.trim()
+            );
+        }
+
+        let final_message = std::fs::read_to_string(&output_path)
+            .unwrap_or_else(|_| stdout.clone())
+            .trim()
+            .to_string();
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        if final_message.is_empty() {
+            anyhow::bail!(
+                "Codex CLI provider returned an empty message. stderr: {} stdout: {}",
+                stderr.trim(),
+                stdout.trim()
+            );
+        }
+
+        Ok(final_message)
+    }
+}
+
+#[async_trait::async_trait]
+impl AIProvider for CodexCliProvider {
+    async fn complete(&self, messages: Vec<Message>) -> Result<AIResponse> {
+        self.complete_with_request(AICompletionRequest::from_messages(messages))
+            .await
+    }
+
+    async fn complete_with_request(&self, request: AICompletionRequest) -> Result<AIResponse> {
+        let prompt = self.render_prompt(&request);
+        let content = self.run_codex_exec(&prompt).await?;
+        Ok(AIResponse {
+            content,
+            confidence: None,
+            tool_calls: None,
+            finish_reason: "stop".to_string(),
+            usage: None,
+        })
+    }
+
+    fn supports_tool_calling(&self) -> bool {
+        true
+    }
+
+    fn max_context_tokens(&self) -> usize {
+        128_000
+    }
+
+    fn cost_tier(&self) -> CostTier {
+        CostTier::Cheap
+    }
+}
+
 /// Google Gemini.
 pub struct GeminiProvider {
     model: String,
@@ -1317,5 +1548,50 @@ mod tests {
 
         cfg.api_rate_limit_rpm = 0;
         assert_eq!(cfg.rate_limit_for_provider("openai"), None);
+    }
+
+    #[test]
+    fn test_codex_prompt_includes_mail_subsystem_tool_protocol() {
+        let provider = CodexCliProvider {
+            bin: "codex".to_string(),
+            model: None,
+            profile: None,
+            sandbox: "read-only".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let request = AICompletionRequest {
+            messages: vec![
+                Message::system("Return JSON only."),
+                Message::user("Find matching emails."),
+            ],
+            tools: vec![CompletionTool {
+                name: "search_similar_emails".to_string(),
+                description: "Find similar messages by query".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    }
+                }),
+            }],
+            tool_choice: ToolChoice::Auto,
+            temperature: 0.2,
+            max_tokens: Some(512),
+        };
+
+        let prompt = provider.render_prompt(&request);
+
+        assert!(prompt.contains("pure completion backend for MailSubsystem"));
+        assert!(prompt.contains(r#"{"action":"use_tool","tool":"<tool_name>","args":{}}"#));
+        assert!(prompt.contains("search_similar_emails"));
+        assert!(prompt.contains("<system>\nReturn JSON only.\n</system>"));
+        assert!(prompt.contains("<user>\nFind matching emails.\n</user>"));
+    }
+
+    #[test]
+    fn test_codex_provider_is_not_api_rate_limited() {
+        let cfg = AIConfig::default();
+
+        assert_eq!(cfg.rate_limit_for_provider("codex"), None);
     }
 }
