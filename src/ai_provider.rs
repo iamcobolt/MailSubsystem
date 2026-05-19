@@ -1088,7 +1088,49 @@ impl CodexCliProvider {
         std::env::temp_dir().join(format!("mailsubsystem-codex-work-{}", Uuid::new_v4()))
     }
 
+    async fn ensure_logged_in(&self) -> Result<()> {
+        let mut command = Command::new(&self.bin);
+        command
+            .arg("login")
+            .arg("status")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = match tokio::time::timeout(Duration::from_secs(15), command.output()).await {
+            Ok(result) => result.map_err(|err| {
+                anyhow!(
+                    "failed to start Codex CLI with `{}`: {}. Install the Codex CLI or set CODEX_BIN to its path.",
+                    self.bin,
+                    err
+                )
+            })?,
+            Err(_) => {
+                anyhow::bail!(
+                    "Codex CLI login check timed out. Run `codex login status` to inspect the local Codex session."
+                );
+            }
+        };
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Codex CLI is not logged in. Run `codex login` once, then retry. \
+             For headless environments, try `codex login --device-auth`. \
+             `codex login status` stderr: {} stdout: {}",
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
     async fn run_codex_exec(&self, prompt: &str) -> Result<String> {
+        self.ensure_logged_in().await?;
+
         let output_path = Self::temp_output_path();
         let work_dir = Self::temp_work_dir();
         std::fs::create_dir_all(&work_dir).context("create Codex CLI temp workdir")?;

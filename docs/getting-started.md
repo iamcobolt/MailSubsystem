@@ -287,6 +287,10 @@ OpenAI API key for MailSubsystem LLM calls, sign in to the local Codex CLI first
 codex login
 ```
 
+MailSubsystem checks `codex login status` before each Codex-backed request. If
+the CLI is not logged in, it will stop with instructions to run `codex login` or
+`codex login --device-auth` for headless environments.
+
 Then configure MailSubsystem to use the Codex CLI provider:
 
 ```env
