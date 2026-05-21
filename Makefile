@@ -4,7 +4,7 @@ DEV_ENV_DIR ?= ../mailsubsystem-dev-env
 # ── Hobbyist workflow ────────────────────────────────────────────────────────
 
 setup: ## Create core .env template and build release binary
-	@if [ ! -f .env ]; then cp env.example .env; echo "Created .env from env.example"; fi
+	@if [ ! -f .env ]; then cp .env.example .env; echo "Created .env from .env.example"; fi
 	cargo build --release
 	@echo ""
 	@echo "Core setup complete."

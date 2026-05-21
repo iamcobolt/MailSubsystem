@@ -119,7 +119,7 @@ When the preview looks right, `make file` applies moves inside the sandbox. See 
 ```bash
 git clone https://github.com/iamcobolt/MailSubsystem.git
 cd MailSubsystem
-cp env.example .env
+cp .env.example .env
 make build
 ```
 
@@ -157,7 +157,7 @@ make -C ../mailsubsystem-dev-env reset
 
 ## Configuration
 
-Configuration comes from `.env` or environment variables. Start from [env.example](env.example).
+Configuration comes from `.env` or environment variables. Start from [.env.example](.env.example).
 
 Required for live mailbox processing:
 
@@ -242,7 +242,7 @@ MailSubsystem/
   specs/workers/         Ephemeral worker specs consumed by the sub-agent runtime
   specs/skills/          Shared policy guidance composed into specs and analysis prompts
   schema.sql            Canonical PostgreSQL schema
-  env.example           Environment variable reference
+  .env.example          Environment variable reference
   Makefile              Common local workflows
 ```
 
