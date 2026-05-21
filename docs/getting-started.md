@@ -163,7 +163,7 @@ When you're ready to use MailSubsystem with your real email, switch to live mode
 ```bash
 git clone https://github.com/iamcobolt/MailSubsystem.git
 cd MailSubsystem
-cp env.example .env
+cp .env.example .env
 make build
 ```
 
@@ -612,4 +612,4 @@ Your email is untouched by the database reset. MailSubsystem reads via IMAP and 
 - **Tune the AI:** Try `AI_PROVIDER=hybrid` with a local LLM for cheap bulk analysis + frontier for hard cases
 - **Embeddings:** Run `./target/release/mailsubsystem embed-backfill` to enable semantic search (RAG) for better analysis context
 - **Custom folders:** The location agent creates folders based on your email patterns — review and adjust by running `locate` + `file --dry-run` before applying
-- **Multiple accounts:** Create an `accounts.toml` to manage multiple mailboxes (see `env.example` for the format)
+- **Multiple accounts:** Create an `accounts.toml` to manage multiple mailboxes (see `.env.example` for the format)

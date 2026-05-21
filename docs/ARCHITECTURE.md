@@ -109,7 +109,7 @@ Core takes a per-account Postgres advisory lease before it can process work, so 
 
 MailSubsystem can use frontier providers or local OpenAI-compatible endpoints. When cloud providers are enabled, email content needed for analysis is sent to those providers. Local providers keep inference on the operator's own machine, subject to the operator's local model server configuration.
 
-Provider selection and limits are environment-driven. See [env.example](../env.example).
+Provider selection and limits are environment-driven. See [.env.example](../.env.example).
 
 ## Safety Boundaries
 
