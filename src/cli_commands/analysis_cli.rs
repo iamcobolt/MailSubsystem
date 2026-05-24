@@ -436,14 +436,21 @@ struct AnalyzeRuntimeContext {
     analyzer: ai_analysis::EmailAnalyzer,
     max_analysis_attempts: i32,
     analysis_concurrency: usize,
+    worker_id: String,
+    analysis_lock_ttl_secs: i64,
 }
 
-async fn build_analyze_runtime_context(account_id: &str) -> anyhow::Result<AnalyzeRuntimeContext> {
+async fn build_analyze_runtime_context(
+    account_id: &str,
+    concurrency_override: Option<usize>,
+) -> anyhow::Result<AnalyzeRuntimeContext> {
     let _ = dotenvy::from_path(DEFAULT_ENV_PATH);
     let max_analysis_attempts: i32 = std::env::var("MAX_ANALYSIS_ATTEMPTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    let worker_id = analysis_worker_id_from_env();
+    let analysis_lock_ttl_secs = analysis_lock_ttl_secs_from_env();
 
     let db_config = db::DatabaseConfig::load().context("Load database config")?;
     let database = db::Database::new(&db_config.connection_string())
@@ -459,7 +466,9 @@ async fn build_analyze_runtime_context(account_id: &str) -> anyhow::Result<Analy
     let frontier_box = ai::create_provider(&ai_config).context("Create AI provider")?;
     let frontier: Arc<dyn ai::AIProvider> = Arc::from(frontier_box);
     let frontier = wrap_configured_ai_provider(&ai_config, &frontier_name, frontier);
-    let analysis_concurrency = analysis_concurrency_from_env(&ai_config, frontier.is_local());
+    let analysis_concurrency = concurrency_override
+        .map(|value| value.max(1))
+        .unwrap_or_else(|| analysis_concurrency_from_env(&ai_config, frontier.is_local()));
 
     let local = build_local_ai_provider(&ai_config);
 
@@ -482,7 +491,25 @@ async fn build_analyze_runtime_context(account_id: &str) -> anyhow::Result<Analy
         analyzer,
         max_analysis_attempts,
         analysis_concurrency,
+        worker_id,
+        analysis_lock_ttl_secs,
     })
+}
+
+fn analysis_worker_id_from_env() -> String {
+    std::env::var("ANALYSIS_WORKER_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("analysis-{}-{}", std::process::id(), uuid::Uuid::new_v4()))
+}
+
+fn analysis_lock_ttl_secs_from_env() -> i64 {
+    std::env::var("ANALYSIS_LOCK_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(db::DEFAULT_ANALYSIS_LOCK_TTL_SECS)
+        .max(1)
 }
 
 fn analysis_concurrency_from_env(config: &ai::AIConfig, provider_is_local: bool) -> usize {
@@ -524,12 +551,52 @@ fn is_transient_analysis_error(message: &str) -> bool {
         || message.contains("high demand")
 }
 
+async fn record_analysis_failure_for_current_claim(
+    db: &db::Database,
+    account_id: &str,
+    message_id: &str,
+    claim_worker_id: Option<&str>,
+    error: &str,
+) -> anyhow::Result<bool> {
+    if let Some(worker_id) = claim_worker_id {
+        let rows = db
+            .record_analysis_attempt_failed_for_claimed_account(
+                account_id, message_id, worker_id, error,
+            )
+            .await?;
+        Ok(rows > 0)
+    } else {
+        db.record_analysis_attempt_failed_for_account(account_id, message_id, error)
+            .await?;
+        Ok(true)
+    }
+}
+
+async fn mark_analysis_permanent_failure_for_current_claim(
+    db: &db::Database,
+    account_id: &str,
+    message_id: &str,
+    claim_worker_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    if let Some(worker_id) = claim_worker_id {
+        let rows = db
+            .mark_analysis_permanent_failure_for_claimed_account(account_id, message_id, worker_id)
+            .await?;
+        Ok(rows > 0)
+    } else {
+        db.mark_analysis_permanent_failure_for_account(account_id, message_id)
+            .await?;
+        Ok(true)
+    }
+}
+
 async fn analyze_one_record_for_account(
     db: Arc<db::Database>,
     analyzer: &ai_analysis::EmailAnalyzer,
     account_id: &str,
     email: db::EmailRecord,
     max_analysis_attempts: i32,
+    claim_worker_id: Option<&str>,
     worker_instruction: Option<&str>,
     single: bool,
 ) -> AnalyzeRecordOutcome {
@@ -541,16 +608,88 @@ async fn analyze_one_record_for_account(
         .await
     {
         Ok(mut result) => {
-            if let Err(e) = ai_analysis::apply_analysis_result_for_account(
-                db.as_ref(),
-                account_id,
-                &message_id,
-                &mut result,
-            )
-            .await
-            {
+            let apply_result = if let Some(worker_id) = claim_worker_id {
+                ai_analysis::apply_analysis_result_for_claimed_account(
+                    db.as_ref(),
+                    account_id,
+                    &message_id,
+                    worker_id,
+                    &mut result,
+                )
+                .await
+            } else {
+                ai_analysis::apply_analysis_result_for_account(
+                    db.as_ref(),
+                    account_id,
+                    &message_id,
+                    &mut result,
+                )
+                .await
+            };
+
+            if let Err(e) = apply_result {
                 log::error!("[analyze] failed to save {}: {}", message_id, e);
                 metrics::counter("analysis_save_failed_total", 1, &[]);
+                let detail = format_error_chain(&e);
+                match record_analysis_failure_for_current_claim(
+                    db.as_ref(),
+                    account_id,
+                    &message_id,
+                    claim_worker_id,
+                    &detail,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        let attempts = email.analysis_attempts + 1;
+                        if attempts >= max_analysis_attempts {
+                            log::error!(
+                                "[analyze] permanent failure for {} after {} attempts",
+                                message_id,
+                                attempts
+                            );
+                            match mark_analysis_permanent_failure_for_current_claim(
+                                db.as_ref(),
+                                account_id,
+                                &message_id,
+                                claim_worker_id,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => log::warn!(
+                                    "[analyze] did not mark permanent failure for {} because claim is no longer owned",
+                                    message_id
+                                ),
+                                Err(db_err) => {
+                                    log::error!(
+                                        "[analyze] failed to mark permanent failure for {}: {}",
+                                        message_id,
+                                        db_err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        log::warn!(
+                            "[analyze] did not record save failure for {} because claim is no longer owned",
+                            message_id
+                        );
+                    }
+                    Err(db_err) => {
+                        log::warn!(
+                            "[analyze] failed to record save failure for {}: {}",
+                            message_id,
+                            db_err
+                        );
+                    }
+                }
+                return AnalyzeRecordOutcome {
+                    message_id,
+                    error: Some(e),
+                    transient: false,
+                };
             } else {
                 if result.queued_for_frontier {
                     match db
@@ -633,33 +772,56 @@ async fn analyze_one_record_for_account(
             if transient {
                 log::error!("[analyze] stopping analysis: {}", msg);
             }
-            if let Err(db_err) = db
-                .record_analysis_attempt_failed_for_account(account_id, &message_id, &msg)
-                .await
+            match record_analysis_failure_for_current_claim(
+                db.as_ref(),
+                account_id,
+                &message_id,
+                claim_worker_id,
+                &msg,
+            )
+            .await
             {
-                log::warn!(
-                    "[analyze] failed to record attempt for {}: {}",
-                    message_id,
-                    db_err
-                );
-            } else {
-                let attempts = email.analysis_attempts + 1;
-                if attempts >= max_analysis_attempts {
-                    log::error!(
-                        "[analyze] permanent failure for {} after {} attempts",
-                        message_id,
-                        attempts
-                    );
-                    if let Err(db_err) = db
-                        .mark_analysis_permanent_failure_for_account(account_id, &message_id)
-                        .await
-                    {
+                Ok(true) => {
+                    let attempts = email.analysis_attempts + 1;
+                    if attempts >= max_analysis_attempts {
                         log::error!(
-                            "[analyze] failed to mark permanent failure for {}: {}",
+                            "[analyze] permanent failure for {} after {} attempts",
                             message_id,
-                            db_err
+                            attempts
                         );
+                        match mark_analysis_permanent_failure_for_current_claim(
+                            db.as_ref(),
+                            account_id,
+                            &message_id,
+                            claim_worker_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => log::warn!(
+                                "[analyze] did not mark permanent failure for {} because claim is no longer owned",
+                                message_id
+                            ),
+                            Err(db_err) => {
+                                log::error!(
+                                    "[analyze] failed to mark permanent failure for {}: {}",
+                                    message_id,
+                                    db_err
+                                );
+                            }
+                        }
                     }
+                }
+                Ok(false) => log::warn!(
+                    "[analyze] did not record attempt for {} because claim is no longer owned",
+                    message_id
+                ),
+                Err(db_err) => {
+                    log::warn!(
+                        "[analyze] failed to record attempt for {}: {}",
+                        message_id,
+                        db_err
+                    );
                 }
             }
             let detail = format_error_chain(&e);
@@ -679,6 +841,7 @@ async fn analyze_records_for_account(
     account_id: &str,
     emails: &[db::EmailRecord],
     max_analysis_attempts: i32,
+    claim_worker_id: Option<&str>,
     worker_instructions: Option<&HashMap<String, String>>,
     analysis_concurrency: usize,
 ) -> anyhow::Result<()> {
@@ -708,6 +871,7 @@ async fn analyze_records_for_account(
                 account_id,
                 email,
                 max_analysis_attempts,
+                claim_worker_id,
                 worker_instruction,
                 single,
             )
@@ -738,6 +902,7 @@ async fn analyze_records_for_account(
                     account_id,
                     email,
                     max_analysis_attempts,
+                    claim_worker_id,
                     worker_instruction.as_deref(),
                     single,
                 )
@@ -808,36 +973,24 @@ pub async fn run_analyze_with_limit_for_account(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10)
         });
-    let runtime = build_analyze_runtime_context(account_id).await?;
+
+    let Some(id) = message_id else {
+        return run_claimed_analysis_batch_for_account(limit, force, None, account_id).await;
+    };
+
+    let runtime = build_analyze_runtime_context(account_id, None).await?;
     let db = runtime.db.clone();
 
-    let emails: Vec<db::EmailRecord> = if let Some(id) = message_id {
-        if force {
-            println!("--force is ignored for single-message analyze.");
-        }
-        let email = db
-            .get_email_by_message_id_for_account(account_id, &id)
-            .await
-            .context("Fetch email by message_id")?
-            .ok_or_else(|| anyhow::anyhow!("No email found with message_id: {}", id))?;
-        println!("Analyzing one record: {}", id);
-        vec![email]
-    } else {
-        let list = db
-            .get_unanalyzed_emails_for_account(account_id, limit, force)
-            .await
-            .context("Get unanalyzed emails")?;
-        if force {
-            println!(
-                "Analyzing {} emails (limit {}, force mode: reanalyze eligible rows)",
-                list.len(),
-                limit
-            );
-        } else {
-            println!("Analyzing {} emails (limit {})", list.len(), limit);
-        }
-        list
-    };
+    if force {
+        println!("--force is ignored for single-message analyze.");
+    }
+    let email = db
+        .get_email_by_message_id_for_account(account_id, &id)
+        .await
+        .context("Fetch email by message_id")?
+        .ok_or_else(|| anyhow::anyhow!("No email found with message_id: {}", id))?;
+    println!("Analyzing one record: {}", id);
+    let emails = vec![email];
 
     analyze_records_for_account(
         db,
@@ -846,9 +999,98 @@ pub async fn run_analyze_with_limit_for_account(
         &emails,
         runtime.max_analysis_attempts,
         None,
+        None,
         runtime.analysis_concurrency,
     )
     .await
+}
+
+pub async fn run_analyze_worker(limit: usize, concurrency: Option<usize>) -> anyhow::Result<()> {
+    run_analyze_worker_for_account(limit, concurrency, DEFAULT_ACCOUNT_ID).await
+}
+
+pub async fn run_analyze_worker_for_account(
+    limit: usize,
+    concurrency: Option<usize>,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    run_claimed_analysis_batch_for_account(
+        limit.min(u32::MAX as usize) as u32,
+        false,
+        concurrency,
+        account_id,
+    )
+    .await
+}
+
+async fn run_claimed_analysis_batch_for_account(
+    limit: u32,
+    force: bool,
+    concurrency_override: Option<usize>,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    let runtime = build_analyze_runtime_context(account_id, concurrency_override).await?;
+    let db = runtime.db.clone();
+    let emails = db
+        .claim_analysis_emails_for_account(
+            account_id,
+            &runtime.worker_id,
+            limit,
+            force,
+            runtime.analysis_lock_ttl_secs,
+        )
+        .await
+        .context("Claim analysis emails")?;
+    let claimed_message_ids: Vec<String> = emails
+        .iter()
+        .map(|email| email.message_id.clone())
+        .collect();
+
+    if force {
+        println!(
+            "Claimed {} emails for analysis (limit {}, force mode: reanalyze eligible rows, worker {})",
+            emails.len(),
+            limit,
+            runtime.worker_id
+        );
+    } else {
+        println!(
+            "Claimed {} emails for analysis (limit {}, worker {})",
+            emails.len(),
+            limit,
+            runtime.worker_id
+        );
+    }
+
+    let result = analyze_records_for_account(
+        db.clone(),
+        &runtime.analyzer,
+        account_id,
+        &emails,
+        runtime.max_analysis_attempts,
+        Some(&runtime.worker_id),
+        None,
+        runtime.analysis_concurrency,
+    )
+    .await;
+
+    if let Err(error) = db
+        .release_analysis_claims_for_account(
+            account_id,
+            &runtime.worker_id,
+            &claimed_message_ids,
+            "analysis batch cleanup",
+        )
+        .await
+    {
+        log::warn!(
+            "[analyze] failed to release remaining claims for worker {}: {}",
+            runtime.worker_id,
+            error
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]

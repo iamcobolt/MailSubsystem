@@ -43,6 +43,9 @@ pub async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Analyze { message_id, force } => {
             analysis_commands::run_analyze(message_id, force).await
         }
+        Command::AnalyzeWorker { limit, concurrency } => {
+            analysis_commands::run_analyze_worker(limit, concurrency).await
+        }
         Command::TestLlm { local, frontier } => {
             analysis_commands::run_test_llm(local, frontier).await
         }
