@@ -342,6 +342,15 @@ increase `LOCAL_LLM_CONCURRENCY`, or set `ANALYZE_CONCURRENCY` /
 `LOCATE_CONCURRENCY` separately, if your local server and GPU can handle more
 parallel requests.
 
+For higher analysis throughput, keep one core coordinator running and raise the
+per-batch/per-process knobs first: `ANALYZE_CONCURRENCY=4` or `8` and
+`CORE_ANALYZE_LIMIT=100` or `200` are reasonable starting points for capable
+local inference servers. If you want additional analysis-only processes, run
+`mailsubsystem analyze-worker --limit N --concurrency M` in multiple shells; it
+uses Postgres row claims (`ANALYSIS_WORKER_ID`, default generated per process,
+and `ANALYSIS_LOCK_TTL_SECS`, default 900) so workers do not analyze the same
+email concurrently.
+
 If you use a local model for analysis but want frontier embeddings for RAG,
 set `EMBEDDING_PROVIDER=gemini` and keep `GEMINI_API_KEY` or
 `EMBEDDING_API_KEY` configured. For local embeddings, set `EMBEDDING_MODEL` to
