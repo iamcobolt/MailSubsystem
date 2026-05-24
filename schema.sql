@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS emails (
     message_size INTEGER,
     message_tokens INTEGER,
     analyzed_by TEXT,
+    analysis_locked_at TIMESTAMPTZ,
+    analysis_worker_id TEXT,
+    analysis_lock_expires_at TIMESTAMPTZ,
     raw_email_content TEXT,
     body_text TEXT,
     body_synced_at TIMESTAMPTZ,
@@ -907,6 +910,9 @@ ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analysis_failed_at TIMESTA
 ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analysis_permanent_failure BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS last_analysis_error TEXT;
 ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analyzed_by TEXT;
+ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analysis_locked_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analysis_worker_id TEXT;
+ALTER TABLE IF EXISTS emails ADD COLUMN IF NOT EXISTS analysis_lock_expires_at TIMESTAMPTZ;
 
 DO $$
 BEGIN
@@ -943,6 +949,12 @@ WHERE analyzed_at IS NULL
 CREATE INDEX IF NOT EXISTS idx_emails_analyzed_at ON emails(analyzed_at DESC) WHERE analyzed_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_emails_action_pending ON emails(received_date DESC) WHERE analyzed_at IS NOT NULL AND action_status IS NULL;
 CREATE INDEX IF NOT EXISTS idx_emails_analysis_retry ON emails(analysis_permanent_failure, analysis_failed_at, analysis_attempts) WHERE analyzed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_emails_analysis_claim
+ON emails(account_id, analysis_lock_expires_at, received_date DESC)
+WHERE analyzed_at IS NULL
+  AND analysis_permanent_failure = FALSE
+  AND deleted_from_server_at IS NULL
+  AND (body_text IS NOT NULL OR raw_email_content IS NOT NULL);
 
 CREATE TABLE IF NOT EXISTS otp_codes (
     id          BIGSERIAL PRIMARY KEY,

@@ -453,6 +453,383 @@ async fn test_get_unanalyzed_emails_force_includes_analyzed_rows() {
 
 #[tokio::test]
 #[ignore]
+async fn test_claim_unanalyzed_emails_two_workers_claim_disjoint_sets() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping analysis claim test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-disjoint-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+
+    for idx in 0..6 {
+        let message_id = format!("{}{}", prefix, idx);
+        sqlx::query(
+            r#"
+            INSERT INTO emails (account_id, message_id, received_date, body_text)
+            VALUES ($1, $2, NOW() - ($3 * INTERVAL '1 minute'), 'body')
+            "#,
+        )
+        .bind(&account_id)
+        .bind(&message_id)
+        .bind(idx as i64)
+        .execute(&db.pool)
+        .await
+        .expect("insert claim test row");
+    }
+
+    let first = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-a", 3)
+        .await
+        .expect("first claim");
+    let second = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-b", 3)
+        .await
+        .expect("second claim");
+
+    assert_eq!(first.len(), 3);
+    assert_eq!(second.len(), 3);
+
+    let first_ids: HashSet<String> = first.into_iter().map(|email| email.message_id).collect();
+    let second_ids: HashSet<String> = second.into_iter().map(|email| email.message_id).collect();
+    assert!(first_ids.is_disjoint(&second_ids));
+
+    let worker_a_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM emails WHERE account_id = $1 AND analysis_worker_id = 'worker-a'",
+    )
+    .bind(&account_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count worker-a claims");
+    let worker_b_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM emails WHERE account_id = $1 AND analysis_worker_id = 'worker-b'",
+    )
+    .bind(&account_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count worker-b claims");
+
+    assert_eq!(worker_a_count, 3);
+    assert_eq!(worker_b_count, 3);
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_claim_unanalyzed_emails_recovers_stale_locks() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping stale analysis claim test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-stale-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+    let stale_id = format!("{}stale", prefix);
+    let active_id = format!("{}active", prefix);
+
+    sqlx::query(
+        r#"
+        INSERT INTO emails (
+            account_id, message_id, received_date, body_text,
+            analysis_locked_at, analysis_worker_id, analysis_lock_expires_at
+        )
+        VALUES
+            ($1, $2, NOW(), 'body', NOW() - INTERVAL '1 hour', 'worker-stale', NOW() - INTERVAL '1 minute'),
+            ($1, $3, NOW(), 'body', NOW(), 'worker-active', NOW() + INTERVAL '15 minutes')
+        "#,
+    )
+    .bind(&account_id)
+    .bind(&stale_id)
+    .bind(&active_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert stale claim rows");
+
+    let claimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-new", 10)
+        .await
+        .expect("claim after stale recovery");
+    let claimed_ids: HashSet<String> = claimed.into_iter().map(|email| email.message_id).collect();
+
+    assert!(claimed_ids.contains(&stale_id));
+    assert!(!claimed_ids.contains(&active_id));
+
+    let active_worker: Option<String> = sqlx::query_scalar(
+        "SELECT analysis_worker_id FROM emails WHERE account_id = $1 AND message_id = $2",
+    )
+    .bind(&account_id)
+    .bind(&active_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch active worker");
+    assert_eq!(active_worker.as_deref(), Some("worker-active"));
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_failed_analysis_clears_claim_and_respects_retry_backoff() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping failed analysis claim test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-failed-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+    let message_id = format!("{}message", prefix);
+
+    sqlx::query(
+        "INSERT INTO emails (account_id, message_id, received_date, body_text) VALUES ($1, $2, NOW(), 'body')",
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert failed analysis row");
+
+    let claimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-failed", 1)
+        .await
+        .expect("claim failed analysis row");
+    assert_eq!(claimed.len(), 1);
+
+    db.record_analysis_attempt_failed_for_account(&account_id, &message_id, "boom")
+        .await
+        .expect("record failed analysis");
+
+    let row = sqlx::query(
+        r#"
+        SELECT analysis_attempts,
+               analysis_failed_at IS NOT NULL AS has_failed_at,
+               analysis_locked_at IS NULL AS unlocked_at,
+               analysis_worker_id IS NULL AS unlocked_worker,
+               analysis_lock_expires_at IS NULL AS unlocked_expires
+        FROM emails
+        WHERE account_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch failed analysis row");
+
+    assert_eq!(row.get::<i32, _>("analysis_attempts"), 1);
+    assert!(row.get::<bool, _>("has_failed_at"));
+    assert!(row.get::<bool, _>("unlocked_at"));
+    assert!(row.get::<bool, _>("unlocked_worker"));
+    assert!(row.get::<bool, _>("unlocked_expires"));
+
+    let immediate_retry = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-immediate", 1)
+        .await
+        .expect("immediate retry claim");
+    assert!(immediate_retry.is_empty());
+
+    sqlx::query(
+        "UPDATE emails SET analysis_failed_at = NOW() - INTERVAL '3 minutes' WHERE account_id = $1 AND message_id = $2",
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .execute(&db.pool)
+    .await
+    .expect("age failed analysis row");
+
+    let retry = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-retry", 1)
+        .await
+        .expect("retry claim");
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0].message_id, message_id);
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_claimed_analysis_update_requires_current_worker() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping claimed analysis update test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-update-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+    let message_id = format!("{}message", prefix);
+
+    sqlx::query(
+        "INSERT INTO emails (account_id, message_id, received_date, body_text) VALUES ($1, $2, NOW(), 'body')",
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert claimed update row");
+
+    let claimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-owner", 1)
+        .await
+        .expect("claim update row");
+    assert_eq!(claimed.len(), 1);
+
+    let update = UpdateAiFieldsInput {
+        message_id: &message_id,
+        spam_status: Some("not-spam"),
+        phishing_status: Some("not-phishing"),
+        marketing_status: Some("not-marketing"),
+        otp_status: Some("not_otp"),
+        otp_code: None,
+        otp_expires: None,
+        threat_level: Some("none"),
+        threat_indicators: None,
+        ai_summary: None,
+        human_summary: Some("summary"),
+        category: Some("personal"),
+        subcategory: None,
+        organization: Some("Example"),
+        topic: Some("testing"),
+        email_type: Some("reference"),
+        location_recommendation: None,
+        location_create_if_missing: None,
+        offer_expires: None,
+    };
+
+    let wrong_worker_rows = db
+        .update_ai_fields_for_claimed_account(&account_id, "worker-other", &update)
+        .await
+        .expect("wrong worker claimed update");
+    assert_eq!(wrong_worker_rows, 0);
+
+    let owner_rows = db
+        .update_ai_fields_for_claimed_account(&account_id, "worker-owner", &update)
+        .await
+        .expect("owner claimed update");
+    assert_eq!(owner_rows, 1);
+
+    let row = sqlx::query(
+        r#"
+        SELECT analyzed_at IS NOT NULL AS analyzed,
+               analysis_locked_at IS NULL AS unlocked_at,
+               analysis_worker_id IS NULL AS unlocked_worker,
+               analysis_lock_expires_at IS NULL AS unlocked_expires
+        FROM emails
+        WHERE account_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch claimed update row");
+
+    assert!(row.get::<bool, _>("analyzed"));
+    assert!(row.get::<bool, _>("unlocked_at"));
+    assert!(row.get::<bool, _>("unlocked_worker"));
+    assert!(row.get::<bool, _>("unlocked_expires"));
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_permanent_failure_is_unlocked_and_not_reclaimed() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping permanent failure claim test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-permanent-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+    let message_id = format!("{}message", prefix);
+
+    sqlx::query(
+        "INSERT INTO emails (account_id, message_id, received_date, body_text) VALUES ($1, $2, NOW(), 'body')",
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert permanent failure row");
+
+    let claimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-permanent", 1)
+        .await
+        .expect("claim permanent failure row");
+    assert_eq!(claimed.len(), 1);
+
+    db.mark_analysis_permanent_failure_for_account(&account_id, &message_id)
+        .await
+        .expect("mark permanent failure");
+
+    let row = sqlx::query(
+        r#"
+        SELECT analysis_permanent_failure,
+               analysis_locked_at IS NULL AS unlocked_at,
+               analysis_worker_id IS NULL AS unlocked_worker,
+               analysis_lock_expires_at IS NULL AS unlocked_expires
+        FROM emails
+        WHERE account_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch permanent failure row");
+    assert!(row.get::<bool, _>("analysis_permanent_failure"));
+    assert!(row.get::<bool, _>("unlocked_at"));
+    assert!(row.get::<bool, _>("unlocked_worker"));
+    assert!(row.get::<bool, _>("unlocked_expires"));
+
+    let reclaimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-reclaim", 1)
+        .await
+        .expect("reclaim permanent failure");
+    assert!(reclaimed.is_empty());
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_already_analyzed_email_is_not_claimed_for_normal_analysis() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping analyzed claim test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("claim-analyzed-{}", Uuid::new_v4());
+    let prefix = format!("{}-", account_id);
+    cleanup_test_emails(&db, &prefix).await;
+    let message_id = format!("{}message", prefix);
+
+    sqlx::query(
+        "INSERT INTO emails (account_id, message_id, received_date, body_text, analyzed_at) VALUES ($1, $2, NOW(), 'body', NOW())",
+    )
+    .bind(&account_id)
+    .bind(&message_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert analyzed row");
+
+    let claimed = db
+        .claim_unanalyzed_emails_for_account(&account_id, "worker-analyzed", 1)
+        .await
+        .expect("claim analyzed row");
+    assert!(claimed.is_empty());
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_get_emails_needing_location_force_includes_existing_recommendations() {
     let Some(db) = load_test_database().await else {
         eprintln!("Skipping locate force test (no TEST_DATABASE_URL or DATABASE_URL)");
