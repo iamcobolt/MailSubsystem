@@ -403,6 +403,27 @@ pub async fn apply_analysis_result_for_account(
     message_id: &str,
     r: &mut AnalysisResult,
 ) -> Result<u64> {
+    apply_analysis_result_for_account_with_claim(db, account_id, message_id, None, r).await
+}
+
+pub async fn apply_analysis_result_for_claimed_account(
+    db: &Database,
+    account_id: &str,
+    message_id: &str,
+    worker_id: &str,
+    r: &mut AnalysisResult,
+) -> Result<u64> {
+    apply_analysis_result_for_account_with_claim(db, account_id, message_id, Some(worker_id), r)
+        .await
+}
+
+async fn apply_analysis_result_for_account_with_claim(
+    db: &Database,
+    account_id: &str,
+    message_id: &str,
+    worker_id: Option<&str>,
+    r: &mut AnalysisResult,
+) -> Result<u64> {
     let category = infer_category_from_result(r);
     preserve_unaligned_category_as_subcategory(r);
     let email_type = infer_email_type_from_result(r);
@@ -449,9 +470,19 @@ pub async fn apply_analysis_result_for_account(
         location_create_if_missing: None, // from location analysis, not classification
         offer_expires: r.offer_expires,
     };
-    let updated = db
-        .update_ai_fields_for_account(account_id, &update_fields)
-        .await?;
+    let updated = if let Some(worker_id) = worker_id {
+        db.update_ai_fields_for_claimed_account(account_id, worker_id, &update_fields)
+            .await?
+    } else {
+        db.update_ai_fields_for_account(account_id, &update_fields)
+            .await?
+    };
+    if updated == 0 {
+        anyhow::bail!(
+            "analysis claim no longer owned by worker for message_id {}",
+            message_id
+        );
+    }
     let _ = db
         .set_analyzed_by_for_account(account_id, message_id, r.analyzed_by.as_deref())
         .await?;
