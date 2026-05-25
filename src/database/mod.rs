@@ -29,7 +29,10 @@ pub use completeness::DbCompletenessSnapshot;
 pub use config::{DatabaseConfig, SchemaMigrationMode};
 pub use connection::Database;
 pub use conversations::ConversationMessageInsert;
-pub use core_work::{CoreWorkQueueEntry, CoreWorkStatusItem, CoreWorkStatusSummary, CoreWorkType};
+pub use core_work::{
+    CoreWorkBackpressureConfig, CoreWorkEnqueueOutcome, CoreWorkQueueEntry, CoreWorkQueuePressure,
+    CoreWorkStatusItem, CoreWorkStatusSummary, CoreWorkType,
+};
 pub use email_analysis::{PendingLocationApply, UpdateAiFieldsInput};
 pub use email_queries::{DigestWindowStats, EmailListFilters};
 pub use frontier_queue::FrontierQueueEntry;

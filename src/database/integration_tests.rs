@@ -1521,6 +1521,143 @@ async fn test_core_work_claim_prioritizes_pipeline_over_subagent_support() {
 
 #[tokio::test]
 #[ignore]
+async fn test_core_work_completion_requires_current_claim_lease() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping core work claim lease test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("core-lease-{}", Uuid::new_v4());
+    cleanup_test_core_work_account(&db, &account_id).await;
+
+    db.enqueue_core_work_for_account(
+        &account_id,
+        CoreWorkType::Analyze,
+        "lease-fenced",
+        serde_json::json!({"reason": "lease_fencing_test"}),
+    )
+    .await
+    .expect("enqueue lease test work");
+
+    let stale_claim = db
+        .claim_core_work_with_lease_for_account(&account_id, "worker-stale", 60)
+        .await
+        .expect("claim stale work")
+        .expect("stale claim");
+
+    sqlx::query(
+        "UPDATE core_work_queue SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE account_id = $1 AND id = $2",
+    )
+    .bind(&account_id)
+    .bind(stale_claim.id)
+    .execute(&db.pool)
+    .await
+    .expect("expire stale claim");
+
+    let reset = db
+        .reset_stale_core_work_for_account(&account_id, 60)
+        .await
+        .expect("reset expired lease");
+    assert_eq!(reset, 1);
+
+    let current_claim = db
+        .claim_core_work_with_lease_for_account(&account_id, "worker-current", 60)
+        .await
+        .expect("claim current work")
+        .expect("current claim");
+    assert_eq!(current_claim.id, stale_claim.id);
+
+    let stale_completed = db
+        .mark_claimed_core_work_done_for_account(&account_id, &stale_claim)
+        .await
+        .expect("stale completion should be handled");
+    assert!(!stale_completed);
+
+    let current_completed = db
+        .mark_claimed_core_work_done_for_account(&account_id, &current_claim)
+        .await
+        .expect("current completion should win");
+    assert!(current_completed);
+
+    let row = sqlx::query(
+        "SELECT status, worker_id, locked_at, lease_expires_at FROM core_work_queue WHERE account_id = $1 AND id = $2",
+    )
+    .bind(&account_id)
+    .bind(current_claim.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch completed row");
+    assert_eq!(row.get::<String, _>("status"), "done");
+    assert_eq!(row.get::<Option<String>, _>("worker_id"), None);
+    assert_eq!(row.get::<Option<DateTime<Utc>>, _>("locked_at"), None);
+    assert_eq!(
+        row.get::<Option<DateTime<Utc>>, _>("lease_expires_at"),
+        None
+    );
+
+    cleanup_test_core_work_account(&db, &account_id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_core_work_enqueue_backpressure_rejects_new_active_rows() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping core work backpressure test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("core-backpressure-{}", Uuid::new_v4());
+    cleanup_test_core_work_account(&db, &account_id).await;
+    let backpressure = CoreWorkBackpressureConfig { max_active: 1 };
+
+    let first = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Analyze,
+            "first",
+            serde_json::json!({"reason": "backpressure_test"}),
+            backpressure,
+        )
+        .await
+        .expect("enqueue first work");
+    assert!(matches!(first, CoreWorkEnqueueOutcome::Enqueued(_)));
+
+    let second = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Embed,
+            "second",
+            serde_json::json!({"reason": "backpressure_test"}),
+            backpressure,
+        )
+        .await
+        .expect("backpressure second work");
+    assert!(matches!(
+        second,
+        CoreWorkEnqueueOutcome::Backpressured(CoreWorkQueuePressure {
+            active: 1,
+            max_active: 1,
+            backpressured: true
+        })
+    ));
+
+    let existing = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Analyze,
+            "first",
+            serde_json::json!({"reason": "backpressure_existing_update"}),
+            backpressure,
+        )
+        .await
+        .expect("existing active work can be refreshed");
+    assert!(matches!(existing, CoreWorkEnqueueOutcome::Enqueued(_)));
+
+    cleanup_test_core_work_account(&db, &account_id).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_subagent_skill_lessons_reinforce_existing_memory() {
     let Some(db) = load_test_database().await else {
         eprintln!("Skipping skill lesson test (no TEST_DATABASE_URL or DATABASE_URL)");

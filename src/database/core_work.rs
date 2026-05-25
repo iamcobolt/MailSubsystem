@@ -66,6 +66,9 @@ pub struct CoreWorkQueueEntry {
     pub payload: Value,
     pub attempt_count: i32,
     pub max_attempts: i32,
+    pub worker_id: String,
+    pub locked_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -74,6 +77,40 @@ pub struct CoreWorkQueueDepth {
     pub failed: i64,
     pub processing: i64,
     pub dead: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreWorkBackpressureConfig {
+    pub max_active: i64,
+}
+
+impl CoreWorkBackpressureConfig {
+    pub fn from_env() -> Self {
+        let max_active = std::env::var("CORE_WORK_QUEUE_MAX_ACTIVE")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_CORE_WORK_QUEUE_MAX_ACTIVE)
+            .max(1);
+        Self { max_active }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoreWorkQueuePressure {
+    pub active: i64,
+    pub max_active: i64,
+    pub backpressured: bool,
+}
+
+impl CoreWorkQueuePressure {
+    fn new(active: i64, max_active: i64) -> Self {
+        let max_active = max_active.max(1);
+        Self {
+            active,
+            max_active,
+            backpressured: active >= max_active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +127,7 @@ pub struct CoreWorkStatusItem {
     pub last_error: Option<String>,
     pub available_at: DateTime<Utc>,
     pub locked_at: Option<DateTime<Utc>>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -108,11 +146,34 @@ pub struct CoreWorkStatusSummary {
     pub account_id: String,
     pub state: String,
     pub queue_depth: CoreWorkQueueDepth,
+    pub queue_pressure: CoreWorkQueuePressure,
     pub active_work: Vec<CoreWorkStatusItem>,
     pub recent_failures: Vec<CoreWorkStatusItem>,
     pub recent_completed: Vec<CoreWorkStatusItem>,
     pub pipeline: CorePipelineTimestamps,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreWorkEnqueueOutcome {
+    Enqueued(u64),
+    Backpressured(CoreWorkQueuePressure),
+}
+
+const DEFAULT_CORE_WORK_QUEUE_MAX_ACTIVE: i64 = 10_000;
+const DEFAULT_CORE_WORK_LEASE_SECS: i64 = 600;
+
+fn core_work_claim_lease_secs_from_env() -> i64 {
+    std::env::var("CORE_WORK_LEASE_SECS")
+        .or_else(|_| std::env::var("CORE_WORK_STALE_AFTER_SECS"))
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_CORE_WORK_LEASE_SECS)
+        .max(1)
+}
+
+fn core_work_status_is_active(status: &str) -> bool {
+    matches!(status, "pending" | "failed" | "processing")
 }
 
 fn payload_text(payload: &Value, key: &str) -> Option<String> {
@@ -138,11 +199,25 @@ fn core_work_status_item_from_row(row: &PgRow) -> CoreWorkStatusItem {
         last_error: row.get::<Option<String>, _>("last_error"),
         available_at: row.get::<DateTime<Utc>, _>("available_at"),
         locked_at: row.get::<Option<DateTime<Utc>>, _>("locked_at"),
+        lease_expires_at: row.get::<Option<DateTime<Utc>>, _>("lease_expires_at"),
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
         updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
         completed_at: row.get::<Option<DateTime<Utc>>, _>("completed_at"),
         payload,
     }
+}
+
+fn core_work_queue_entry_from_row(row: &PgRow) -> Result<CoreWorkQueueEntry> {
+    Ok(CoreWorkQueueEntry {
+        id: row.get::<i64, _>("id"),
+        work_type: CoreWorkType::from_str(&row.get::<String, _>("work_type"))?,
+        payload: row.get::<Json<Value>, _>("payload").0,
+        attempt_count: row.get::<i32, _>("attempt_count"),
+        max_attempts: row.get::<i32, _>("max_attempts"),
+        worker_id: row.get::<String, _>("worker_id"),
+        locked_at: row.get::<DateTime<Utc>, _>("locked_at"),
+        lease_expires_at: row.get::<DateTime<Utc>, _>("lease_expires_at"),
+    })
 }
 
 fn core_state_from_work(depth: &CoreWorkQueueDepth, active: &[CoreWorkStatusItem]) -> String {
@@ -169,6 +244,35 @@ fn core_state_from_work(depth: &CoreWorkQueueDepth, active: &[CoreWorkStatusItem
     }
 }
 
+fn record_core_work_lease_rejected(account_id: &str, claim: &CoreWorkQueueEntry, action: &str) {
+    let source = payload_text(&claim.payload, "requested_by")
+        .or_else(|| payload_text(&claim.payload, "source"))
+        .unwrap_or_else(|| "system".to_string());
+    let reason =
+        payload_text(&claim.payload, "reason").unwrap_or_else(|| "unspecified".to_string());
+    crate::metrics::counter(
+        "core_work_lease_rejected_total",
+        1,
+        &[("work_type", claim.work_type.as_str()), ("action", action)],
+    );
+    log::warn!(
+        target: "core_work",
+        "{}",
+        serde_json::json!({
+            "event": "core_work_lease_rejected",
+            "account_id": account_id,
+            "id": claim.id,
+            "work_type": claim.work_type.as_str(),
+            "source": source,
+            "reason": reason,
+            "action": action,
+            "worker_id": claim.worker_id.as_str(),
+            "locked_at": claim.locked_at,
+            "claimed_lease_expires_at": claim.lease_expires_at,
+        })
+    );
+}
+
 impl Database {
     pub async fn enqueue_core_work_for_account(
         &self,
@@ -177,14 +281,95 @@ impl Database {
         idempotency_key: &str,
         payload: Value,
     ) -> Result<u64> {
+        match self
+            .try_enqueue_core_work_for_account(
+                account_id,
+                work_type,
+                idempotency_key,
+                payload,
+                CoreWorkBackpressureConfig::from_env(),
+            )
+            .await?
+        {
+            CoreWorkEnqueueOutcome::Enqueued(rows) => Ok(rows),
+            CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+                anyhow::bail!(
+                    "core work queue backpressure: active {} >= max {}",
+                    pressure.active,
+                    pressure.max_active
+                )
+            }
+        }
+    }
+
+    pub async fn try_enqueue_core_work_for_account(
+        &self,
+        account_id: &str,
+        work_type: CoreWorkType,
+        idempotency_key: &str,
+        payload: Value,
+        backpressure: CoreWorkBackpressureConfig,
+    ) -> Result<CoreWorkEnqueueOutcome> {
+        let source = payload_text(&payload, "requested_by")
+            .or_else(|| payload_text(&payload, "source"))
+            .unwrap_or_else(|| "system".to_string());
+        let reason = payload_text(&payload, "reason").unwrap_or_else(|| "unspecified".to_string());
+        let existing_status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM core_work_queue
+            WHERE account_id = $1
+              AND work_type = $2
+              AND idempotency_key = $3
+            "#,
+        )
+        .bind(account_id)
+        .bind(work_type.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load existing core work status for backpressure")?;
+        let pressure = self
+            .core_work_queue_pressure_for_account_with_limit(account_id, backpressure.max_active)
+            .await?;
+        let would_increase_active = existing_status
+            .as_deref()
+            .map(|status| !core_work_status_is_active(status))
+            .unwrap_or(true);
+        if would_increase_active && pressure.backpressured {
+            crate::metrics::counter(
+                "core_work_enqueue_backpressure_total",
+                1,
+                &[
+                    ("work_type", work_type.as_str()),
+                    ("source", source.as_str()),
+                ],
+            );
+            log::warn!(
+                target: "core_work",
+                "{}",
+                serde_json::json!({
+                    "event": "core_work_enqueue_backpressure",
+                    "account_id": account_id,
+                    "work_type": work_type.as_str(),
+                    "idempotency_key": idempotency_key,
+                    "source": source,
+                    "reason": reason,
+                    "active": pressure.active,
+                    "max_active": pressure.max_active,
+                })
+            );
+            return Ok(CoreWorkEnqueueOutcome::Backpressured(pressure));
+        }
+
         let result = sqlx::query(
             r#"
             INSERT INTO core_work_queue (
                 account_id, work_type, idempotency_key, payload, status, attempt_count,
-                max_attempts, available_at, locked_at, worker_id, last_error, created_at,
-                updated_at, completed_at
+                max_attempts, available_at, locked_at, lease_expires_at, worker_id,
+                last_error, created_at, updated_at, completed_at
             )
-            VALUES ($1, $2, $3, $4, 'pending', 0, 3, NOW(), NULL, NULL, NULL, NOW(), NOW(), NULL)
+            VALUES ($1, $2, $3, $4, 'pending', 0, 3, NOW(), NULL, NULL, NULL, NULL, NOW(), NOW(), NULL)
             ON CONFLICT (account_id, work_type, idempotency_key) DO UPDATE
             SET
                 payload = EXCLUDED.payload,
@@ -202,6 +387,10 @@ impl Database {
                 END,
                 locked_at = CASE
                     WHEN core_work_queue.status = 'processing' THEN core_work_queue.locked_at
+                    ELSE NULL
+                END,
+                lease_expires_at = CASE
+                    WHEN core_work_queue.status = 'processing' THEN core_work_queue.lease_expires_at
                     ELSE NULL
                 END,
                 worker_id = CASE
@@ -223,10 +412,6 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("enqueue_core_work")?;
-        let source = payload_text(&payload, "requested_by")
-            .or_else(|| payload_text(&payload, "source"))
-            .unwrap_or_else(|| "system".to_string());
-        let reason = payload_text(&payload, "reason").unwrap_or_else(|| "unspecified".to_string());
         crate::metrics::counter(
             "core_work_enqueue_total",
             1,
@@ -248,13 +433,27 @@ impl Database {
                 "rows_affected": result.rows_affected(),
             })
         );
-        Ok(result.rows_affected())
+        Ok(CoreWorkEnqueueOutcome::Enqueued(result.rows_affected()))
     }
 
     pub async fn claim_core_work_for_account(
         &self,
         account_id: &str,
         worker_id: &str,
+    ) -> Result<Option<CoreWorkQueueEntry>> {
+        self.claim_core_work_with_lease_for_account(
+            account_id,
+            worker_id,
+            core_work_claim_lease_secs_from_env(),
+        )
+        .await
+    }
+
+    pub async fn claim_core_work_with_lease_for_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        lease_secs: i64,
     ) -> Result<Option<CoreWorkQueueEntry>> {
         let row = sqlx::query(
             r#"
@@ -292,28 +491,25 @@ impl Database {
             SET status = 'processing',
                 attempt_count = q.attempt_count + 1,
                 locked_at = NOW(),
+                lease_expires_at = NOW() + ($3 * INTERVAL '1 second'),
                 worker_id = $2,
                 updated_at = NOW()
             FROM claimable c
             WHERE q.account_id = $1
               AND q.id = c.id
-            RETURNING q.id, q.work_type, q.payload, q.attempt_count, q.max_attempts
+            RETURNING q.id, q.work_type, q.payload, q.attempt_count, q.max_attempts,
+                      q.worker_id, q.locked_at, q.lease_expires_at
             "#,
         )
         .bind(account_id)
         .bind(worker_id)
+        .bind(lease_secs.max(1))
         .fetch_optional(&self.pool)
         .await
         .context("claim_core_work")?;
 
         row.map(|r| {
-            let entry = CoreWorkQueueEntry {
-                id: r.get::<i64, _>("id"),
-                work_type: CoreWorkType::from_str(&r.get::<String, _>("work_type"))?,
-                payload: r.get::<Json<Value>, _>("payload").0,
-                attempt_count: r.get::<i32, _>("attempt_count"),
-                max_attempts: r.get::<i32, _>("max_attempts"),
-            };
+            let entry = core_work_queue_entry_from_row(&r)?;
             let source = payload_text(&entry.payload, "requested_by")
                 .or_else(|| payload_text(&entry.payload, "source"))
                 .unwrap_or_else(|| "system".to_string());
@@ -340,6 +536,8 @@ impl Database {
                     "attempt_count": entry.attempt_count,
                     "max_attempts": entry.max_attempts,
                     "worker_id": worker_id,
+                    "locked_at": entry.locked_at,
+                    "lease_expires_at": entry.lease_expires_at,
                 })
             );
             Ok(entry)
@@ -353,6 +551,24 @@ impl Database {
         worker_id: &str,
         work_type: CoreWorkType,
         limit: usize,
+    ) -> Result<Vec<CoreWorkQueueEntry>> {
+        self.claim_core_work_batch_with_lease_for_account(
+            account_id,
+            worker_id,
+            work_type,
+            limit,
+            core_work_claim_lease_secs_from_env(),
+        )
+        .await
+    }
+
+    pub async fn claim_core_work_batch_with_lease_for_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        work_type: CoreWorkType,
+        limit: usize,
+        lease_secs: i64,
     ) -> Result<Vec<CoreWorkQueueEntry>> {
         let rows = sqlx::query(
             r#"
@@ -371,32 +587,27 @@ impl Database {
             SET status = 'processing',
                 attempt_count = q.attempt_count + 1,
                 locked_at = NOW(),
+                lease_expires_at = NOW() + ($5 * INTERVAL '1 second'),
                 worker_id = $2,
                 updated_at = NOW()
             FROM claimable c
             WHERE q.account_id = $1
               AND q.id = c.id
-            RETURNING q.id, q.work_type, q.payload, q.attempt_count, q.max_attempts
+            RETURNING q.id, q.work_type, q.payload, q.attempt_count, q.max_attempts,
+                      q.worker_id, q.locked_at, q.lease_expires_at
             "#,
         )
         .bind(account_id)
         .bind(worker_id)
         .bind(work_type.as_str())
         .bind(limit.min(i64::MAX as usize) as i64)
+        .bind(lease_secs.max(1))
         .fetch_all(&self.pool)
         .await
         .context("claim_core_work_batch")?;
 
         rows.into_iter()
-            .map(|r| {
-                Ok(CoreWorkQueueEntry {
-                    id: r.get::<i64, _>("id"),
-                    work_type: CoreWorkType::from_str(&r.get::<String, _>("work_type"))?,
-                    payload: r.get::<Json<Value>, _>("payload").0,
-                    attempt_count: r.get::<i32, _>("attempt_count"),
-                    max_attempts: r.get::<i32, _>("max_attempts"),
-                })
-            })
+            .map(|r| core_work_queue_entry_from_row(&r))
             .collect()
     }
 
@@ -438,28 +649,40 @@ impl Database {
             .unwrap_or(true))
     }
 
-    pub async fn mark_core_work_done_for_account(&self, account_id: &str, id: i64) -> Result<u64> {
+    pub async fn mark_claimed_core_work_done_for_account(
+        &self,
+        account_id: &str,
+        claim: &CoreWorkQueueEntry,
+    ) -> Result<bool> {
         let row = sqlx::query(
             r#"
             UPDATE core_work_queue
             SET status = 'done',
                 locked_at = NULL,
+                lease_expires_at = NULL,
                 worker_id = NULL,
                 last_error = NULL,
                 completed_at = NOW(),
                 updated_at = NOW()
             WHERE account_id = $1
               AND id = $2
+              AND status = 'processing'
+              AND worker_id = $3
+              AND locked_at = $4
+              AND lease_expires_at > NOW()
             RETURNING work_type, payload
             "#,
         )
         .bind(account_id)
-        .bind(id)
+        .bind(claim.id)
+        .bind(&claim.worker_id)
+        .bind(claim.locked_at)
         .fetch_optional(&self.pool)
         .await
         .context("mark_core_work_done")?;
         let Some(row) = row else {
-            return Ok(0);
+            record_core_work_lease_rejected(account_id, claim, "complete");
+            return Ok(false);
         };
         let payload = row.get::<Json<Value>, _>("payload").0;
         let work_type = row.get::<String, _>("work_type");
@@ -481,26 +704,24 @@ impl Database {
             serde_json::json!({
                 "event": "core_work_complete",
                 "account_id": account_id,
-                "id": id,
+                "id": claim.id,
                 "work_type": work_type,
                 "source": source,
                 "reason": reason,
                 "rows_affected": 1,
             })
         );
-        Ok(1)
+        Ok(true)
     }
 
-    pub async fn mark_core_work_retry_or_dead_for_account(
+    pub async fn mark_claimed_core_work_retry_or_dead_for_account(
         &self,
         account_id: &str,
-        id: i64,
-        attempt_count: i32,
-        max_attempts: i32,
+        claim: &CoreWorkQueueEntry,
         retry_after_secs: i64,
         error: &str,
-    ) -> Result<String> {
-        let next_status = if attempt_count >= max_attempts {
+    ) -> Result<Option<String>> {
+        let next_status = if claim.attempt_count >= claim.max_attempts {
             "dead"
         } else {
             "failed"
@@ -511,25 +732,33 @@ impl Database {
             SET status = $3,
                 available_at = CASE WHEN $3 = 'failed' THEN NOW() + ($4 * INTERVAL '1 second') ELSE available_at END,
                 locked_at = NULL,
+                lease_expires_at = NULL,
                 worker_id = NULL,
                 last_error = LEFT($5, 4000),
                 updated_at = NOW()
             WHERE account_id = $1
               AND id = $2
+              AND status = 'processing'
+              AND worker_id = $6
+              AND locked_at = $7
+              AND lease_expires_at > NOW()
             RETURNING work_type, payload
             "#,
         )
         .bind(account_id)
-        .bind(id)
+        .bind(claim.id)
         .bind(next_status)
         .bind(retry_after_secs.max(0))
         .bind(error)
+        .bind(&claim.worker_id)
+        .bind(claim.locked_at)
         .fetch_optional(&self.pool)
         .await
         .context("mark_core_work_retry_or_dead")?;
 
         let Some(row) = row else {
-            anyhow::bail!("mark_core_work_retry_or_dead: queue item {} not found", id);
+            record_core_work_lease_rejected(account_id, claim, "fail");
+            return Ok(None);
         };
         let payload = row.get::<Json<Value>, _>("payload").0;
         let work_type = row.get::<String, _>("work_type");
@@ -556,18 +785,73 @@ impl Database {
             serde_json::json!({
                 "event": if next_status == "dead" { "core_work_dead_letter" } else { "core_work_retry" },
                 "account_id": account_id,
-                "id": id,
+                "id": claim.id,
                 "work_type": work_type,
                 "source": source,
                 "reason": reason,
                 "status": next_status,
-                "attempt_count": attempt_count,
-                "max_attempts": max_attempts,
+                "attempt_count": claim.attempt_count,
+                "max_attempts": claim.max_attempts,
                 "retry_after_secs": retry_after_secs.max(0),
                 "error": error,
             })
         );
-        Ok(next_status.to_string())
+        Ok(Some(next_status.to_string()))
+    }
+
+    pub async fn renew_core_work_lease_for_account(
+        &self,
+        account_id: &str,
+        claim: &CoreWorkQueueEntry,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            UPDATE core_work_queue
+            SET lease_expires_at = NOW() + ($5 * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND id = $2
+              AND status = 'processing'
+              AND worker_id = $3
+              AND locked_at = $4
+              AND lease_expires_at > NOW()
+            RETURNING lease_expires_at
+            "#,
+        )
+        .bind(account_id)
+        .bind(claim.id)
+        .bind(&claim.worker_id)
+        .bind(claim.locked_at)
+        .bind(lease_secs.max(1))
+        .fetch_optional(&self.pool)
+        .await
+        .context("renew_core_work_lease")?;
+
+        let Some(row) = row else {
+            record_core_work_lease_rejected(account_id, claim, "renew");
+            return Ok(false);
+        };
+        let lease_expires_at = row.get::<DateTime<Utc>, _>("lease_expires_at");
+        crate::metrics::counter(
+            "core_work_lease_renew_total",
+            1,
+            &[("work_type", claim.work_type.as_str())],
+        );
+        log::debug!(
+            target: "core_work",
+            "{}",
+            serde_json::json!({
+                "event": "core_work_lease_renew",
+                "account_id": account_id,
+                "id": claim.id,
+                "work_type": claim.work_type.as_str(),
+                "worker_id": claim.worker_id.as_str(),
+                "locked_at": claim.locked_at,
+                "lease_expires_at": lease_expires_at,
+            })
+        );
+        Ok(true)
     }
 
     pub async fn reset_stale_core_work_for_account(
@@ -581,13 +865,17 @@ impl Database {
             SET status = 'failed',
                 available_at = NOW(),
                 locked_at = NULL,
+                lease_expires_at = NULL,
                 worker_id = NULL,
-                last_error = COALESCE(last_error, 'stale lock reset'),
+                last_error = COALESCE(last_error, 'expired lease reset'),
                 updated_at = NOW()
             WHERE account_id = $1
               AND status = 'processing'
               AND locked_at IS NOT NULL
-              AND locked_at < NOW() - ($2 * INTERVAL '1 second')
+              AND (
+                    lease_expires_at <= NOW()
+                 OR (lease_expires_at IS NULL AND locked_at < NOW() - ($2 * INTERVAL '1 second'))
+              )
             "#,
         )
         .bind(account_id)
@@ -597,11 +885,16 @@ impl Database {
         .context("reset_stale_core_work")?;
         if result.rows_affected() > 0 {
             crate::metrics::counter("core_work_stale_reset_total", result.rows_affected(), &[]);
+            crate::metrics::counter(
+                "core_work_lease_expired_reset_total",
+                result.rows_affected(),
+                &[],
+            );
             log::warn!(
                 target: "core_work",
                 "{}",
                 serde_json::json!({
-                    "event": "core_work_stale_reset",
+                    "event": "core_work_lease_expired_reset",
                     "account_id": account_id,
                     "rows_affected": result.rows_affected(),
                     "stale_after_secs": stale_after_secs.max(1),
@@ -622,6 +915,7 @@ impl Database {
             SET status = 'failed',
                 available_at = NOW(),
                 locked_at = NULL,
+                lease_expires_at = NULL,
                 worker_id = NULL,
                 last_error = LEFT($2, 4000),
                 updated_at = NOW()
@@ -698,6 +992,7 @@ impl Database {
             SET status = 'failed',
                 available_at = NOW(),
                 locked_at = NULL,
+                lease_expires_at = NULL,
                 worker_id = NULL,
                 last_error = LEFT($3, 4000),
                 updated_at = NOW()
@@ -792,6 +1087,37 @@ impl Database {
         })
     }
 
+    pub async fn core_work_queue_pressure_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<CoreWorkQueuePressure> {
+        self.core_work_queue_pressure_for_account_with_limit(
+            account_id,
+            CoreWorkBackpressureConfig::from_env().max_active,
+        )
+        .await
+    }
+
+    pub async fn core_work_queue_pressure_for_account_with_limit(
+        &self,
+        account_id: &str,
+        max_active: i64,
+    ) -> Result<CoreWorkQueuePressure> {
+        let active = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM core_work_queue
+            WHERE account_id = $1
+              AND status IN ('pending', 'failed', 'processing')
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("core_work_queue_pressure")?;
+        Ok(CoreWorkQueuePressure::new(active, max_active))
+    }
+
     pub async fn has_active_core_work_type_for_account(
         &self,
         account_id: &str,
@@ -840,6 +1166,19 @@ impl Database {
         account_id: &str,
     ) -> Result<CoreWorkStatusSummary> {
         let queue_depth = self.core_work_queue_depth_for_account(account_id).await?;
+        let queue_pressure = self
+            .core_work_queue_pressure_for_account(account_id)
+            .await?;
+        crate::metrics::gauge(
+            "core_work_queue_active",
+            queue_pressure.active as f64,
+            &[("account_id", account_id)],
+        );
+        crate::metrics::gauge(
+            "core_work_queue_pressure",
+            queue_pressure.active as f64 / queue_pressure.max_active as f64,
+            &[("account_id", account_id)],
+        );
         let active_work = self
             .list_core_work_status_items_for_account(
                 account_id,
@@ -898,6 +1237,7 @@ impl Database {
             account_id: account_id.to_string(),
             state,
             queue_depth,
+            queue_pressure,
             active_work,
             recent_failures,
             recent_completed,
@@ -916,8 +1256,8 @@ impl Database {
         let sql = format!(
             r#"
             SELECT id, work_type, idempotency_key, payload, status, attempt_count,
-                   max_attempts, available_at, locked_at, worker_id, last_error,
-                   created_at, updated_at, completed_at
+                   max_attempts, available_at, locked_at, lease_expires_at,
+                   worker_id, last_error, created_at, updated_at, completed_at
             FROM core_work_queue
             WHERE account_id = $1 AND {}
             ORDER BY {}
@@ -976,6 +1316,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queue_pressure_marks_active_count_at_or_above_limit_as_backpressured() {
+        let under = CoreWorkQueuePressure::new(9, 10);
+        assert_eq!(under.active, 9);
+        assert_eq!(under.max_active, 10);
+        assert!(!under.backpressured);
+
+        let at_limit = CoreWorkQueuePressure::new(10, 10);
+        assert_eq!(at_limit.active, 10);
+        assert!(at_limit.backpressured);
+
+        let invalid_limit = CoreWorkQueuePressure::new(1, 0);
+        assert_eq!(invalid_limit.max_active, 1);
+        assert!(invalid_limit.backpressured);
+    }
+
     fn core_status_item_for_test(work_type: &str) -> CoreWorkStatusItem {
         let now = Utc::now();
         CoreWorkStatusItem {
@@ -991,6 +1347,7 @@ mod tests {
             last_error: None,
             available_at: now,
             locked_at: Some(now),
+            lease_expires_at: Some(now + chrono::Duration::seconds(600)),
             created_at: now,
             updated_at: now,
             completed_at: None,
