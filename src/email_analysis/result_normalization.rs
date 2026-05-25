@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::ai::AnalysisResult;
@@ -12,6 +13,12 @@ const PHISHING_STATUS_ALLOWED: &[&str] = &["phishing", "not-phishing"];
 const MARKETING_STATUS_ALLOWED: &[&str] = &["marketing", "not-marketing"];
 const OTP_STATUS_ALLOWED: &[&str] = &["otp", "magic_link", "password_reset", "not_otp"];
 const THREAT_LEVEL_ALLOWED: &[&str] = &["none", "low", "medium", "high", "critical"];
+
+#[derive(Debug, Clone)]
+struct OtpExpiryBase {
+    sent_at: DateTime<Utc>,
+    offset: FixedOffset,
+}
 
 /// Allowed category values (DB CHECK). Normalize AI output to lowercase.
 pub(super) const CATEGORY_ALLOWED: &[&str] = &[
@@ -298,6 +305,357 @@ pub(super) fn infer_email_type_from_result(r: &AnalysisResult) -> Option<String>
 
 pub(super) fn infer_otp_status_from_result(r: &AnalysisResult) -> &'static str {
     normalize_otp_status(r.otp_status.as_deref()).unwrap_or("not_otp")
+}
+
+pub(super) fn prepare_analysis_output_for_deserialization(
+    output: &Value,
+    received_date: Option<DateTime<Utc>>,
+    raw_email_content: Option<&str>,
+) -> (Value, Option<DateTime<Utc>>) {
+    let resolved_otp_expiry =
+        resolve_otp_expiry_from_output(output, received_date, raw_email_content);
+    let mut prepared = output.clone();
+    let Some(object) = prepared.as_object_mut() else {
+        return (prepared, resolved_otp_expiry);
+    };
+
+    if let Some(expiry) = resolved_otp_expiry {
+        object.insert(
+            "otp_expires".to_string(),
+            Value::String(expiry.to_rfc3339()),
+        );
+    } else if output
+        .get("otp_expires")
+        .is_some_and(|value| !value.is_null())
+    {
+        // AnalysisResult stores only resolved DateTime<Utc>. If the model gave
+        // an unresolved free-text value, keep it in raw ai_summary and avoid a
+        // serde failure here.
+        object.remove("otp_expires");
+    }
+
+    (prepared, resolved_otp_expiry)
+}
+
+pub(super) fn resolve_otp_expiry_from_output(
+    output: &Value,
+    received_date: Option<DateTime<Utc>>,
+    raw_email_content: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    let base = otp_expiry_base(received_date, raw_email_content);
+
+    if let Some(expiry_value) = output.get("otp_expires") {
+        if let Some(expiry) = resolve_otp_expiry_value(expiry_value, base.as_ref()) {
+            return Some(expiry);
+        }
+    }
+
+    if let Some(minutes) = output.get("otp_expires_minutes").and_then(|value| {
+        if value.is_null() {
+            None
+        } else {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        }
+    }) {
+        let minutes = minutes.max(0);
+        return base
+            .as_ref()
+            .and_then(|base| base.sent_at.checked_add_signed(Duration::minutes(minutes)));
+    }
+
+    None
+}
+
+fn resolve_otp_expiry_value(value: &Value, base: Option<&OtpExpiryBase>) -> Option<DateTime<Utc>> {
+    let value = value.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(expiry) = parse_absolute_datetime(value) {
+        return Some(expiry);
+    }
+
+    let base = base?;
+    if let Some(duration) = parse_relative_duration(value) {
+        return base.sent_at.checked_add_signed(duration);
+    }
+    if let Some(expiry) = parse_naive_datetime_with_base_offset(value, base) {
+        return Some(expiry);
+    }
+    parse_wall_clock_with_base(value, base)
+}
+
+fn otp_expiry_base(
+    received_date: Option<DateTime<Utc>>,
+    raw_email_content: Option<&str>,
+) -> Option<OtpExpiryBase> {
+    if let Some(date_header) = raw_email_content.and_then(|raw| extract_header_value(raw, "date")) {
+        if let Some(parsed) = parse_email_date_header(&date_header) {
+            return Some(OtpExpiryBase {
+                sent_at: parsed.with_timezone(&Utc),
+                offset: *parsed.offset(),
+            });
+        }
+    }
+
+    received_date.map(|sent_at| OtpExpiryBase {
+        sent_at,
+        offset: FixedOffset::east_opt(0).expect("zero offset is valid"),
+    })
+}
+
+fn parse_email_date_header(header: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc2822(header)
+        .ok()
+        .or_else(|| DateTime::parse_from_rfc3339(header).ok())
+}
+
+fn parse_absolute_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .or_else(|| DateTime::parse_from_rfc2822(value).ok())
+        .or_else(|| parse_datetime_with_numeric_offset(value))
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn parse_datetime_with_numeric_offset(value: &str) -> Option<DateTime<FixedOffset>> {
+    [
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%d %H:%M %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M%z",
+    ]
+    .iter()
+    .find_map(|format| DateTime::parse_from_str(value, format).ok())
+}
+
+fn parse_naive_datetime_with_base_offset(
+    value: &str,
+    base: &OtpExpiryBase,
+) -> Option<DateTime<Utc>> {
+    [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    .iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+    .and_then(|naive| {
+        base.offset
+            .from_local_datetime(&naive)
+            .single()
+            .map(|datetime| datetime.with_timezone(&Utc))
+    })
+}
+
+fn parse_wall_clock_with_base(value: &str, base: &OtpExpiryBase) -> Option<DateTime<Utc>> {
+    let (time_text, offset) = split_trailing_offset(value).unwrap_or_else(|| {
+        (
+            value.trim().to_string(),
+            FixedOffset::east_opt(base.offset.local_minus_utc())
+                .expect("existing offset seconds are valid"),
+        )
+    });
+    let time = parse_wall_clock_time(&time_text)?;
+    let sent_local = base.sent_at.with_timezone(&offset);
+    let mut date = sent_local.date_naive();
+    let mut expiry = datetime_from_local_parts(date, time, offset)?;
+    if expiry < base.sent_at {
+        date = date.succ_opt()?;
+        expiry = datetime_from_local_parts(date, time, offset)?;
+    }
+    Some(expiry)
+}
+
+fn datetime_from_local_parts(
+    date: chrono::NaiveDate,
+    time: NaiveTime,
+    offset: FixedOffset,
+) -> Option<DateTime<Utc>> {
+    offset
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn parse_wall_clock_time(value: &str) -> Option<NaiveTime> {
+    let mut text = value.trim().trim_end_matches('.').trim().to_string();
+    for prefix in [
+        "expires at ",
+        "expire at ",
+        "expires by ",
+        "expire by ",
+        "valid until ",
+        "until ",
+        "by ",
+        "at ",
+    ] {
+        if text.to_ascii_lowercase().starts_with(prefix) {
+            text = text[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+    let upper = text
+        .replace("a.m.", "AM")
+        .replace("p.m.", "PM")
+        .replace("am", "AM")
+        .replace("pm", "PM")
+        .to_ascii_uppercase();
+    [
+        "%H:%M:%S",
+        "%H:%M",
+        "%I:%M:%S %p",
+        "%I:%M %p",
+        "%I %p",
+        "%I:%M:%S%p",
+        "%I:%M%p",
+        "%I%p",
+    ]
+    .iter()
+    .find_map(|format| NaiveTime::parse_from_str(&upper, format).ok())
+}
+
+fn split_trailing_offset(value: &str) -> Option<(String, FixedOffset)> {
+    let trimmed = value.trim();
+    let (before, offset_text) = trimmed.rsplit_once(' ')?;
+    parse_fixed_offset(offset_text).map(|offset| (before.trim().to_string(), offset))
+}
+
+fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let value = value.trim().to_ascii_uppercase();
+    if matches!(value.as_str(), "Z" | "UTC" | "UT" | "GMT") {
+        return FixedOffset::east_opt(0);
+    }
+
+    let sign = match value.as_bytes().first().copied()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = value[1..].replace(':', "");
+    if digits.len() != 2 && digits.len() != 4 {
+        return None;
+    }
+    let hours = digits.get(0..2)?.parse::<i32>().ok()?;
+    let minutes = if digits.len() == 4 {
+        digits.get(2..4)?.parse::<i32>().ok()?
+    } else {
+        0
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    FixedOffset::east_opt(sign * ((hours * 3600) + (minutes * 60)))
+}
+
+fn parse_relative_duration(value: &str) -> Option<Duration> {
+    let normalized = value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let mut total_seconds = 0.0;
+    let mut found = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((amount, unit_seconds)) = parse_number_unit_token(tokens[index]) {
+            total_seconds += amount * unit_seconds;
+            found = true;
+            index += 1;
+            continue;
+        }
+        if let Ok(amount) = tokens[index].parse::<f64>() {
+            if let Some(unit_seconds) = tokens.get(index + 1).and_then(|unit| unit_seconds(unit)) {
+                total_seconds += amount * unit_seconds;
+                found = true;
+                index += 2;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    if found && total_seconds.is_finite() && total_seconds >= 0.0 {
+        Some(Duration::seconds(total_seconds.round() as i64))
+    } else {
+        None
+    }
+}
+
+fn parse_number_unit_token(token: &str) -> Option<(f64, f64)> {
+    let split_at = token
+        .char_indices()
+        .find_map(|(index, ch)| (!(ch.is_ascii_digit() || ch == '.')).then_some(index))?;
+    let amount = token.get(..split_at)?.parse::<f64>().ok()?;
+    let unit = token.get(split_at..)?;
+    unit_seconds(unit).map(|seconds| (amount, seconds))
+}
+
+fn unit_seconds(unit: &str) -> Option<f64> {
+    match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(1.0),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(60.0),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(3600.0),
+        "d" | "day" | "days" => Some(86_400.0),
+        _ => None,
+    }
+}
+
+fn extract_header_value(raw: &str, header_name: &str) -> Option<String> {
+    let needle = header_name.to_ascii_lowercase();
+    let mut current_name: Option<String> = None;
+    let mut current_value = String::new();
+
+    for line in raw.lines().take(400) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return header_value_if_match(&current_name, &current_value, &needle);
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if current_name.is_some() {
+                if !current_value.is_empty() {
+                    current_value.push(' ');
+                }
+                current_value.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some(value) = header_value_if_match(&current_name, &current_value, &needle) {
+            return Some(value);
+        }
+        current_name = None;
+        current_value.clear();
+        if let Some((name, value)) = line.split_once(':') {
+            current_name = Some(name.trim().to_ascii_lowercase());
+            current_value.push_str(value.trim());
+        }
+    }
+
+    header_value_if_match(&current_name, &current_value, &needle)
+}
+
+fn header_value_if_match(name: &Option<String>, value: &str, needle: &str) -> Option<String> {
+    if name
+        .as_ref()
+        .map(|name| name.eq_ignore_ascii_case(needle))
+        .unwrap_or(false)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 pub(super) fn apply_classification_reflection_result(
