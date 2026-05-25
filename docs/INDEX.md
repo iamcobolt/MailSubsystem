@@ -11,6 +11,7 @@ every internal folder. Start here when you need the right document quickly.
 | Understand runtime architecture | [Architecture](ARCHITECTURE.md) |
 | Understand agents, workers, and skills | [Agent System](AGENT_SYSTEM.md) |
 | Inspect database ownership and schema posture | [Database Guide](DATABASE.md) |
+| Review spend confirmation, panic-disable, and audit policy | [Spend Safety](SPEND_SAFETY.md) |
 | Review exact database DDL | [`../schema.sql`](../schema.sql) |
 | Review release notes | [`../CHANGELOG.md`](../CHANGELOG.md) |
 

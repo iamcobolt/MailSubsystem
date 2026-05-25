@@ -293,6 +293,7 @@ pub struct AIConfig {
     pub gemini_rate_limit_rpm: Option<u32>,
     pub openai_rate_limit_rpm: Option<u32>,
     pub anthropic_rate_limit_rpm: Option<u32>,
+    pub spend_safety: crate::spend_safety::SpendSafetyConfig,
 }
 
 fn redacted_optional_secret(value: &Option<String>) -> Option<&'static str> {
@@ -323,6 +324,7 @@ impl fmt::Debug for AIConfig {
             .field("gemini_rate_limit_rpm", &self.gemini_rate_limit_rpm)
             .field("openai_rate_limit_rpm", &self.openai_rate_limit_rpm)
             .field("anthropic_rate_limit_rpm", &self.anthropic_rate_limit_rpm)
+            .field("spend_safety", &self.spend_safety)
             .finish()
     }
 }
@@ -346,6 +348,7 @@ impl Default for AIConfig {
             gemini_rate_limit_rpm: None,
             openai_rate_limit_rpm: None,
             anthropic_rate_limit_rpm: None,
+            spend_safety: crate::spend_safety::SpendSafetyConfig::default(),
         }
     }
 }
@@ -427,6 +430,8 @@ impl AIConfig {
         let anthropic_rate_limit_rpm = std::env::var("ANTHROPIC_RATE_LIMIT_RPM")
             .ok()
             .and_then(|v| v.parse().ok());
+        let spend_safety = crate::spend_safety::SpendSafetyConfig::load_from_env()
+            .context("load spend safety config")?;
 
         Ok(Self {
             provider,
@@ -445,6 +450,7 @@ impl AIConfig {
             gemini_rate_limit_rpm,
             openai_rate_limit_rpm,
             anthropic_rate_limit_rpm,
+            spend_safety,
         })
     }
 

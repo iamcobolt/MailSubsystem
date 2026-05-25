@@ -358,6 +358,10 @@ Each email analysis is usually one LLM API call. Costs and rate limits change, s
 
 For a first live run, sync a small window such as one week of email and review results before increasing batch sizes.
 
+Spend confirmation, panic-disable, and approval audit policy are tracked in
+[Spend Safety](SPEND_SAFETY.md). The current foundation is audit-only until the
+CLI, TUI, API, and runtime provider call sites are wired to enforce approvals.
+
 ### Step 4: Configure and verify
 
 Edit your `.env` with the credentials from steps 2 and 3:
