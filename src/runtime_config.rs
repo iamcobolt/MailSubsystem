@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_ACCOUNT_ID: &str = "default";
 pub const DEFAULT_API_BIND: &str = "127.0.0.1:3100";
+pub const DEFAULT_LOCAL_API_RATE_LIMIT_RPM: u32 = 120;
 const DEFAULT_IMAP_PORT: u16 = 993;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,38 @@ pub fn api_auth_token() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub fn api_auth_token_scopes() -> Vec<String> {
+    env_first(&["API_AUTH_TOKEN_SCOPES", "MAILSUBSYSTEM_API_TOKEN_SCOPES"])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn local_api_rate_limit_rpm() -> Result<Option<u32>> {
+    let Some(value) = env_first(&[
+        "LOCAL_API_RATE_LIMIT_RPM",
+        "MAILSUBSYSTEM_LOCAL_API_RATE_LIMIT_RPM",
+    ]) else {
+        return Ok(Some(DEFAULT_LOCAL_API_RATE_LIMIT_RPM));
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(DEFAULT_LOCAL_API_RATE_LIMIT_RPM));
+    }
+
+    let rpm = trimmed
+        .parse::<u32>()
+        .with_context(|| format!("parse LOCAL_API_RATE_LIMIT_RPM value '{}'", value))?;
+    Ok((rpm > 0).then_some(rpm))
+}
+
 pub fn validate_api_bind_security(bind: &str) -> Result<ApiBindScope> {
     let scope = classify_api_bind_addr(bind)?;
     if scope == ApiBindScope::Tailscale && api_auth_token().is_none() {
@@ -285,6 +318,10 @@ mod tests {
             "API_BIND",
             "API_AUTH_TOKEN",
             "MAILSUBSYSTEM_API_TOKEN",
+            "API_AUTH_TOKEN_SCOPES",
+            "MAILSUBSYSTEM_API_TOKEN_SCOPES",
+            "LOCAL_API_RATE_LIMIT_RPM",
+            "MAILSUBSYSTEM_LOCAL_API_RATE_LIMIT_RPM",
             "API_ALLOWED_ORIGINS",
             "API_ALLOW_ORIGIN",
             "IMAP_SERVER",
@@ -486,6 +523,46 @@ username = "primary@example.com"
         assert_eq!(
             api_allowed_origins(),
             vec!["http://localhost:5173".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_api_auth_token_scopes_parse_csv() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_test_env();
+
+        assert!(api_auth_token_scopes().is_empty());
+
+        std::env::set_var(
+            "API_AUTH_TOKEN_SCOPES",
+            " dashboard:read, dashboard:admin ,, ",
+        );
+        assert_eq!(
+            api_auth_token_scopes(),
+            vec!["dashboard:read".to_string(), "dashboard:admin".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_local_api_rate_limit_defaults_parses_and_disables() {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_test_env();
+
+        assert_eq!(
+            local_api_rate_limit_rpm().expect("default rate limit"),
+            Some(DEFAULT_LOCAL_API_RATE_LIMIT_RPM)
+        );
+
+        std::env::set_var("LOCAL_API_RATE_LIMIT_RPM", "42");
+        assert_eq!(
+            local_api_rate_limit_rpm().expect("configured rate limit"),
+            Some(42)
+        );
+
+        std::env::set_var("LOCAL_API_RATE_LIMIT_RPM", "0");
+        assert_eq!(
+            local_api_rate_limit_rpm().expect("disabled rate limit"),
+            None
         );
     }
 }
