@@ -1,6 +1,7 @@
 use anyhow::Context;
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -221,6 +222,10 @@ pub async fn run_show(message_id: Option<String>) -> anyhow::Result<()> {
         println!("  ai_summary:      (none)");
     }
     Ok(())
+}
+
+pub async fn run_classification_eval(corpus: Option<String>) -> anyhow::Result<()> {
+    ai_analysis::run_classification_eval(corpus.as_deref().map(Path::new))
 }
 
 pub async fn run_process_frontier_queue(limit: usize) -> anyhow::Result<()> {

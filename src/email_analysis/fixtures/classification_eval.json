@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "minimum_accuracy": 1.0,
+  "cases": [
+    {
+      "id": "user_configured_job_alert",
+      "title": "User-configured job alert stays work notification",
+      "email": {
+        "message_id": "eval-user-configured-job-alert@example",
+        "subject": "8 new security roles match your job alert",
+        "sender": "jobs-noreply@linkedin.com",
+        "body_text": "You set up a job alert for security roles. Review new Lead Security Engineer and Staff Detection Engineer openings that match your preferences.",
+        "raw_email_content": "List-Id: LinkedIn Job Alerts <jobs.linkedin.com>\r\nList-Unsubscribe: <mailto:unsubscribe@linkedin.com>\r\n\r\nYou set up a job alert for security roles."
+      },
+      "expected": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not_otp",
+        "threat_level": "none",
+        "category": "work",
+        "subcategory": "job_alerts",
+        "email_type": "notification"
+      },
+      "analysis": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not-otp",
+        "threat_level": "none",
+        "category": "work",
+        "subcategory": "job alerts",
+        "organization": "LinkedIn",
+        "topic": "Security job alert",
+        "email_type": "notification",
+        "human_summary": "LinkedIn sent a configured job alert for security roles. No mailbox action is required unless you want to review the matching roles."
+      }
+    },
+    {
+      "id": "fraud_education_newsletter",
+      "title": "Fraud education newsletter is not phishing",
+      "email": {
+        "message_id": "eval-fraud-education-newsletter@example",
+        "subject": "How to spot tax refund scams this season",
+        "sender": "updates@creditunion.example",
+        "body_text": "Your credit union shared fraud prevention tips explaining how to recognize tax refund scams. The article links to the normal education center and does not ask for credentials or payment."
+      },
+      "expected": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not_otp",
+        "threat_level": "none",
+        "category": "financial",
+        "subcategory": "fraud_education",
+        "email_type": "newsletter"
+      },
+      "analysis": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not_otp",
+        "threat_level": "none",
+        "category": "financial",
+        "subcategory": "fraud education",
+        "organization": "Example Credit Union",
+        "topic": "Fraud prevention education",
+        "email_type": "newsletter",
+        "human_summary": "The credit union sent a fraud education newsletter. It is informational and does not request credentials or payment."
+      }
+    },
+    {
+      "id": "hide_my_email_delivery_notice",
+      "title": "Hide My Email delivery notice remains transactional",
+      "email": {
+        "message_id": "eval-hide-my-email-delivery@example",
+        "subject": "Missed delivery attempt for order 4812",
+        "sender": "tracking@narvar.example",
+        "body_text": "Narvar sent a missed delivery notice for an existing order with carrier tracking details and a reschedule link for the shipment.",
+        "raw_email_content": "X-ICLOUD-HME: Forwarded for alias abc123@icloud.com\r\nDKIM-Signature: d=narvar.example\r\n\r\nMissed delivery attempt for order 4812."
+      },
+      "expected": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not_otp",
+        "threat_level": "none",
+        "category": "shopping",
+        "subcategory": "delivery_status",
+        "email_type": "transactional"
+      },
+      "analysis": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "not_otp",
+        "threat_level": "none",
+        "category": "shopping",
+        "subcategory": "delivery status",
+        "organization": "Narvar",
+        "topic": "Missed delivery attempt",
+        "email_type": "transactional",
+        "human_summary": "Narvar sent a transactional missed-delivery notice for an existing order. The Hide My Email alias is context, not standalone spoofing evidence."
+      }
+    },
+    {
+      "id": "magic_link_auth_flow",
+      "title": "Magic link auth flow is classified as magic_link",
+      "email": {
+        "message_id": "eval-magic-link-auth-flow@example",
+        "subject": "Your sign-in link",
+        "sender": "login@product.example",
+        "body_text": "Use this secure one-time sign-in link to access your Product account. The link expires in 15 minutes and was requested from your browser."
+      },
+      "expected": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "magic_link",
+        "threat_level": "none",
+        "category": "work",
+        "subcategory": "account_access",
+        "email_type": "transactional"
+      },
+      "analysis": {
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "magic_link",
+        "threat_level": "none",
+        "category": "work",
+        "subcategory": "account access",
+        "organization": "Product",
+        "topic": "One-time sign-in link",
+        "email_type": "transactional",
+        "human_summary": "Product sent a requested one-time sign-in link. Use it only if you initiated the login."
+      }
+    }
+  ]
+}

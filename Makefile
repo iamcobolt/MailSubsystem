@@ -97,6 +97,9 @@ migrate-schema: build ## Intentionally apply embedded schema.sql to configured d
 test: ## Run tests
 	cargo test
 
+classification-eval: ## Run fixed classification regression eval corpus (set CORPUS=<path> to override)
+	LOG_FILE_PATH=off cargo run -- classification-eval $(if $(CORPUS),--corpus $(CORPUS),)
+
 lint: ## Run clippy + fmt check
 	cargo clippy
 	cargo fmt --check
@@ -114,4 +117,4 @@ advanced-help: ## Show all advanced/admin targets
 .DEFAULT_GOAL := help
 .PHONY: setup build dev-env-start dev-env-stop dev-env-reset dev-env-core-env dev-env-import check test-llm-frontier test-llm-local \
         sync analyze locate file-dry-run file pipeline app core core-apply core-status core-smoke api tui migrate-schema \
-        test lint help advanced-help
+        test classification-eval lint help advanced-help
