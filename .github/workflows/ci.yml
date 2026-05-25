@@ -42,6 +42,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Classification Eval
+        run: make classification-eval
+
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
