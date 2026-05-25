@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::rate_limit::{
     build_local_ai_provider, effective_frontier_provider_name, wrap_configured_ai_provider,
-    wrap_embedding_provider,
+    wrap_embedding_provider_with_pressure,
 };
 use crate::{ai, ai_analysis, config::DEFAULT_ACCOUNT_ID, db, embeddings, metrics};
 
@@ -856,6 +856,51 @@ pub async fn run_analyze_with_limit_for_account(
     .await
 }
 
+pub async fn run_analyze_backlog_for_account(
+    account_id: &str,
+    page_size: usize,
+) -> anyhow::Result<()> {
+    let page_size = page_size.max(1).min(u32::MAX as usize);
+    let limit = page_size as u32;
+    let runtime = build_analyze_runtime_context(account_id).await?;
+    let db = runtime.db.clone();
+    let mut total_analyzed = 0usize;
+
+    loop {
+        let emails = db
+            .get_unanalyzed_emails_for_account(account_id, limit, false)
+            .await
+            .context("Get unanalyzed emails")?;
+        if emails.is_empty() {
+            break;
+        }
+
+        println!(
+            "Analyzing {} email(s) from backlog page size {}",
+            emails.len(),
+            page_size
+        );
+        let count = emails.len();
+        analyze_records_for_account(
+            db.clone(),
+            &runtime.analyzer,
+            account_id,
+            &emails,
+            runtime.max_analysis_attempts,
+            None,
+            runtime.analysis_concurrency,
+        )
+        .await?;
+        total_analyzed += count;
+    }
+
+    println!(
+        "Analysis backlog pass complete after {} candidate email(s)",
+        total_analyzed
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 fn parse_priority_rank_from_batch_plan(plan: Option<&Value>) -> HashMap<String, usize> {
     let mut rank = HashMap::new();
@@ -948,12 +993,14 @@ pub async fn run_embed_backfill_for_account(limit: usize, account_id: &str) -> a
         .await
         .context("Embedding provider required for embed-backfill")?;
     embeddings::validate_embedding_model(&db, embedder.as_ref()).await?;
+    let embedding_provider_name = embedder.provider_name().to_string();
     let rpm = if embedder.is_local() {
         None
     } else {
-        ai_config.rate_limit_for_provider("gemini")
+        ai_config.rate_limit_for_provider(&embedding_provider_name)
     };
-    let embedder = wrap_embedding_provider(Arc::from(embedder), rpm);
+    let embedder =
+        wrap_embedding_provider_with_pressure(Arc::from(embedder), &embedding_provider_name, rpm);
 
     embed_backfill_loop(&db, embedder, account_id, limit).await
 }
@@ -1148,12 +1195,14 @@ pub async fn run_embed_rebuild_for_account(limit: usize, account_id: &str) -> an
 
     // Step 4: Backfill with the new model
     println!("Starting backfill with limit {}...", limit);
+    let embedding_provider_name = embedder.provider_name().to_string();
     let rpm = if embedder.is_local() {
         None
     } else {
-        ai_config.rate_limit_for_provider("gemini")
+        ai_config.rate_limit_for_provider(&embedding_provider_name)
     };
-    let embedder = wrap_embedding_provider(Arc::from(embedder), rpm);
+    let embedder =
+        wrap_embedding_provider_with_pressure(Arc::from(embedder), &embedding_provider_name, rpm);
     embed_backfill_loop(&db, embedder, account_id, limit).await
 }
 

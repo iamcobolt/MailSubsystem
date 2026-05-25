@@ -7,6 +7,8 @@ use async_trait::async_trait;
 use regex::Regex;
 use std::sync::OnceLock;
 
+use crate::model_ref::ModelRef;
+
 /// Provider that embeds text into vectors.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
@@ -18,6 +20,14 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// The model identifier (e.g. "gemini-embedding-001", "snowflake-arctic-embed-l-v2.0-bf16").
     fn model_name(&self) -> &str;
+
+    /// The provider identifier, used as part of the vector-space identity.
+    fn provider_name(&self) -> &str;
+
+    /// Canonical provider/model vector-space identifier.
+    fn model_ref(&self) -> String {
+        format!("{}/{}", self.provider_name(), self.model_name())
+    }
 
     /// Whether this provider uses the local OpenAI-compatible endpoint.
     fn is_local(&self) -> bool;
@@ -151,6 +161,10 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
         &self.model
     }
 
+    fn provider_name(&self) -> &str {
+        "gemini"
+    }
+
     fn is_local(&self) -> bool {
         false
     }
@@ -167,25 +181,36 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
 /// OpenAI-compatible embedding provider (omlx, LM Studio, Ollama, etc.).
 /// Hits POST {base_url}/embeddings with the standard OpenAI embeddings request shape.
 pub struct OpenAICompatibleEmbeddingProvider {
+    provider: String,
     base_url: String,
     model: String,
     dims: usize,
     api_key: Option<String>,
+    local: bool,
     client: reqwest::Client,
 }
 
 impl OpenAICompatibleEmbeddingProvider {
-    pub fn new(base_url: String, model: String, dims: usize, api_key: Option<String>) -> Self {
+    pub fn new(
+        provider: String,
+        base_url: String,
+        model: String,
+        dims: usize,
+        api_key: Option<String>,
+        local: bool,
+    ) -> Self {
         let base_url = base_url
             .trim_end_matches('/')
             .strip_suffix("/embeddings")
             .unwrap_or(base_url.trim_end_matches('/'))
             .to_string();
         Self {
+            provider,
             base_url,
             model,
             dims,
             api_key,
+            local,
             client: reqwest::Client::new(),
         }
     }
@@ -275,8 +300,12 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
         &self.model
     }
 
+    fn provider_name(&self) -> &str {
+        &self.provider
+    }
+
     fn is_local(&self) -> bool {
-        true
+        self.local
     }
 }
 
@@ -285,23 +314,46 @@ enum EmbeddingProviderChoice {
     Auto,
     Local,
     Gemini,
+    OpenAI,
 }
 
 impl EmbeddingProviderChoice {
-    fn from_env() -> Result<Self> {
-        match std::env::var("EMBEDDING_PROVIDER") {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "" | "auto" => Ok(Self::Auto),
-                "local" | "openai-compatible" | "openai_compatible" | "lmstudio" | "ollama" => {
-                    Ok(Self::Local)
+    fn from_env(model_ref: Option<&ModelRef>) -> Result<Self> {
+        if let Some(value) = env_non_empty("EMBEDDING_PROVIDER") {
+            let choice = Self::from_provider_name(&value, "EMBEDDING_PROVIDER")?;
+            if let Some(model_ref) = model_ref {
+                let model_choice =
+                    Self::from_provider_name(model_ref.provider(), "EMBEDDING_MODEL")?;
+                if choice == Self::Auto {
+                    return Ok(model_choice);
                 }
-                "gemini" | "frontier" => Ok(Self::Gemini),
-                other => anyhow::bail!(
-                    "Invalid EMBEDDING_PROVIDER '{}'. Expected auto, local, or gemini.",
-                    other
-                ),
-            },
-            Err(_) => Ok(Self::Auto),
+                if choice != Self::Auto && choice != model_choice {
+                    anyhow::bail!(
+                        "EMBEDDING_MODEL provider '{}' conflicts with EMBEDDING_PROVIDER '{}'",
+                        model_ref.provider(),
+                        value
+                    );
+                }
+            }
+            return Ok(choice);
+        }
+        if let Some(model_ref) = model_ref {
+            return Self::from_provider_name(model_ref.provider(), "EMBEDDING_MODEL");
+        }
+        Ok(Self::Auto)
+    }
+
+    fn from_provider_name(value: &str, name: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "local" | "openai-compatible" | "openai_compatible" | "lmstudio" | "ollama"
+            | "omlx" => Ok(Self::Local),
+            "gemini" | "frontier" => Ok(Self::Gemini),
+            "openai" => Ok(Self::OpenAI),
+            other => anyhow::bail!(
+                "Invalid {name} provider '{}'. Expected auto, local, gemini, or openai.",
+                other
+            ),
         }
     }
 }
@@ -314,38 +366,38 @@ fn env_non_empty(name: &str) -> Option<String> {
 }
 
 fn has_gemini_embedding_config() -> bool {
-    env_non_empty("GEMINI_API_KEY").is_some() || env_non_empty("EMBEDDING_API_KEY").is_some()
+    env_non_empty("GEMINI_API_KEY").is_some() || env_non_empty("EMBEDDING_GEMINI_MODEL").is_some()
 }
 
-fn should_try_local_embedding(choice: EmbeddingProviderChoice) -> bool {
-    match choice {
-        EmbeddingProviderChoice::Local => true,
-        EmbeddingProviderChoice::Gemini => false,
-        EmbeddingProviderChoice::Auto => {
-            if env_non_empty("EMBEDDING_MODEL").is_some() {
-                return true;
-            }
-            env_non_empty("LOCAL_LLM_URL").is_some()
-                && !has_gemini_embedding_config()
-                && env_non_empty("EMBEDDING_GEMINI_MODEL").is_none()
-        }
+fn embedding_model_ref_from_env() -> Result<Option<ModelRef>> {
+    let Some(value) = env_non_empty("EMBEDDING_MODEL") else {
+        return Ok(None);
+    };
+    if value.contains('/') {
+        Ok(Some(ModelRef::parse(&value, "EMBEDDING_MODEL")?))
+    } else {
+        Ok(None)
     }
 }
 
-fn should_try_gemini_embedding(choice: EmbeddingProviderChoice) -> bool {
-    match choice {
-        EmbeddingProviderChoice::Gemini => true,
-        EmbeddingProviderChoice::Local => false,
-        EmbeddingProviderChoice::Auto => has_gemini_embedding_config(),
-    }
+fn plain_embedding_model_from_env() -> Option<String> {
+    env_non_empty("EMBEDDING_MODEL").filter(|value| !value.contains('/'))
 }
 
-async fn create_local_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
-    let base_url =
-        env_non_empty("LOCAL_LLM_URL").context("LOCAL_LLM_URL required for local embeddings")?;
-    let model =
-        env_non_empty("EMBEDDING_MODEL").unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
-    let api_key = env_non_empty("LOCAL_LLM_API_KEY");
+async fn create_local_embedding_provider(
+    model_ref: Option<&ModelRef>,
+) -> Result<Box<dyn EmbeddingProvider>> {
+    let base_url = env_non_empty("EMBEDDING_BASE_URL")
+        .or_else(|| env_non_empty("LOCAL_LLM_URL"))
+        .context("EMBEDDING_BASE_URL or LOCAL_LLM_URL required for local embeddings")?;
+    let provider = model_ref
+        .map(|model_ref| model_ref.provider().to_string())
+        .unwrap_or_else(|| "local".to_string());
+    let model = model_ref
+        .map(|model_ref| model_ref.model().to_string())
+        .or_else(plain_embedding_model_from_env)
+        .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+    let api_key = env_non_empty("EMBEDDING_API_KEY").or_else(|| env_non_empty("LOCAL_LLM_API_KEY"));
     log::info!(
         "Probing embedding model '{}' at {} for dimensions...",
         model,
@@ -356,8 +408,8 @@ async fn create_local_embedding_provider() -> Result<Box<dyn EmbeddingProvider>>
         .with_context(|| {
             format!(
                 "Failed to probe local embedding model dimensions for '{}'. \
-                 Set EMBEDDING_MODEL to an installed embedding model, or set \
-                 EMBEDDING_PROVIDER=gemini to use frontier embeddings.",
+                 Set EMBEDDING_MODEL to an installed local model or to a provider/model ref \
+                 such as gemini/gemini-embedding-001.",
                 model
             )
         })?;
@@ -367,15 +419,53 @@ async fn create_local_embedding_provider() -> Result<Box<dyn EmbeddingProvider>>
         dims
     );
     Ok(Box::new(OpenAICompatibleEmbeddingProvider::new(
-        base_url, model, dims, api_key,
+        provider, base_url, model, dims, api_key, true,
     )))
 }
 
-async fn create_gemini_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
-    let api_key = env_non_empty("GEMINI_API_KEY")
-        .or_else(|| env_non_empty("EMBEDDING_API_KEY"))
-        .context("GEMINI_API_KEY or EMBEDDING_API_KEY required for embeddings")?;
-    let model = env_non_empty("EMBEDDING_GEMINI_MODEL")
+async fn create_openai_embedding_provider(
+    model_ref: Option<&ModelRef>,
+) -> Result<Box<dyn EmbeddingProvider>> {
+    let base_url = env_non_empty("EMBEDDING_BASE_URL")
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let model = model_ref
+        .map(|model_ref| model_ref.model().to_string())
+        .or_else(plain_embedding_model_from_env)
+        .unwrap_or_else(|| "text-embedding-3-small".to_string());
+    let api_key = env_non_empty("EMBEDDING_API_KEY")
+        .or_else(|| env_non_empty("OPENAI_API_KEY"))
+        .context("EMBEDDING_API_KEY or OPENAI_API_KEY required for OpenAI embeddings")?;
+    log::info!(
+        "Probing OpenAI embedding model '{}' for dimensions...",
+        model
+    );
+    let dims = OpenAICompatibleEmbeddingProvider::probe(&base_url, &model, Some(&api_key))
+        .await
+        .context("Failed to probe OpenAI embedding model dimensions")?;
+    log::info!(
+        "Embedding model '{}' produces {}-dimensional vectors",
+        model,
+        dims
+    );
+    Ok(Box::new(OpenAICompatibleEmbeddingProvider::new(
+        "openai".to_string(),
+        base_url,
+        model,
+        dims,
+        Some(api_key),
+        false,
+    )))
+}
+
+async fn create_gemini_embedding_provider(
+    model_ref: Option<&ModelRef>,
+) -> Result<Box<dyn EmbeddingProvider>> {
+    let api_key = env_non_empty("EMBEDDING_API_KEY")
+        .or_else(|| env_non_empty("GEMINI_API_KEY"))
+        .context("EMBEDDING_API_KEY or GEMINI_API_KEY required for embeddings")?;
+    let model = model_ref
+        .map(|model_ref| model_ref.model().to_string())
+        .or_else(|| env_non_empty("EMBEDDING_GEMINI_MODEL"))
         .unwrap_or_else(|| "gemini-embedding-001".to_string());
     log::info!(
         "Probing Gemini embedding model '{}' for dimensions...",
@@ -396,28 +486,34 @@ async fn create_gemini_embedding_provider() -> Result<Box<dyn EmbeddingProvider>
 
 /// Auto-detect embedding provider from environment configuration.
 /// Probes the model to discover its output dimension.
-/// In auto mode, EMBEDDING_MODEL selects local OpenAI-compatible embeddings;
+/// Prefer EMBEDDING_MODEL=provider/model for provider-agnostic selection.
 /// otherwise Gemini/frontier embeddings win when an embedding API key is present.
 /// Returns an error if no embedding provider can be configured.
 pub async fn create_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
-    let choice = EmbeddingProviderChoice::from_env()?;
+    let model_ref = embedding_model_ref_from_env()?;
+    let choice = EmbeddingProviderChoice::from_env(model_ref.as_ref())?;
 
-    if should_try_local_embedding(choice) {
-        return create_local_embedding_provider().await;
+    match choice {
+        EmbeddingProviderChoice::Local => create_local_embedding_provider(model_ref.as_ref()).await,
+        EmbeddingProviderChoice::Gemini => {
+            create_gemini_embedding_provider(model_ref.as_ref()).await
+        }
+        EmbeddingProviderChoice::OpenAI => {
+            create_openai_embedding_provider(model_ref.as_ref()).await
+        }
+        EmbeddingProviderChoice::Auto => {
+            if has_gemini_embedding_config() {
+                return create_gemini_embedding_provider(None).await;
+            }
+            if env_non_empty("LOCAL_LLM_URL").is_some() {
+                return create_local_embedding_provider(None).await;
+            }
+            anyhow::bail!(
+                "No embedding provider configured. Set EMBEDDING_MODEL=provider/model, \
+                 or set EMBEDDING_PROVIDER=local|gemini|openai with the matching provider config."
+            )
+        }
     }
-    if should_try_gemini_embedding(choice) {
-        return create_gemini_embedding_provider().await;
-    }
-
-    if choice == EmbeddingProviderChoice::Auto && env_non_empty("LOCAL_LLM_URL").is_some() {
-        return create_local_embedding_provider().await;
-    }
-
-    anyhow::bail!(
-        "No embedding provider configured. Set EMBEDDING_PROVIDER=local with \
-         LOCAL_LLM_URL and EMBEDDING_MODEL, or set EMBEDDING_PROVIDER=gemini with \
-         GEMINI_API_KEY / EMBEDDING_API_KEY."
-    )
 }
 
 /// Validate that the configured embedding model matches what is stored in the DB.
@@ -429,14 +525,14 @@ pub async fn ensure_embedding_model(
     db: &crate::db::Database,
     provider: &dyn EmbeddingProvider,
 ) -> Result<()> {
-    let current_model = provider.model_name();
+    let current_model = provider.model_ref();
     let current_dims = provider.dimensions().to_string();
     let stored_model = db.get_system_metadata("embedding_model").await?;
     let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
 
     if matches!(
         (&stored_model, &stored_dims),
-        (Some(sm), Some(sd)) if sm == current_model && *sd == current_dims
+        (Some(sm), Some(sd)) if *sm == current_model && *sd == current_dims
     ) {
         log::debug!(
             "Embedding model unchanged: {} ({}d)",
@@ -445,15 +541,23 @@ pub async fn ensure_embedding_model(
         );
         return Ok(());
     }
-
     let _lock = db.acquire_embedding_model_lock().await?;
     let stored_model = db.get_system_metadata("embedding_model").await?;
     let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
 
     match (stored_model, stored_dims) {
-        (Some(ref sm), Some(ref sd)) if sm == current_model && *sd == current_dims => {
+        (Some(ref sm), Some(ref sd)) if *sm == current_model && *sd == current_dims => {
             log::debug!("Embedding model unchanged after lock: {} ({}d)", sm, sd);
             Ok(())
+        }
+        (Some(ref sm), Some(ref sd)) if sm == provider.model_name() && *sd == current_dims => {
+            log::info!(
+                "Updating legacy embedding model metadata from '{}' to '{}' without rebuilding",
+                sm,
+                current_model
+            );
+            db.set_system_metadata("embedding_model", &current_model)
+                .await
         }
         (None, _) | (_, None) => {
             log::info!(
@@ -461,7 +565,7 @@ pub async fn ensure_embedding_model(
                 current_model,
                 current_dims
             );
-            reset_embedding_store(db, provider, current_model, &current_dims, None).await
+            reset_embedding_store(db, provider, &current_model, &current_dims, None).await
         }
         (Some(sm), Some(sd)) => {
             let mode =
@@ -489,8 +593,14 @@ pub async fn ensure_embedding_model(
                 current_model,
                 current_dims
             );
-            reset_embedding_store(db, provider, current_model, &current_dims, Some((&sm, &sd)))
-                .await
+            reset_embedding_store(
+                db,
+                provider,
+                &current_model,
+                &current_dims,
+                Some((&sm, &sd)),
+            )
+            .await
         }
     }
 }
@@ -546,11 +656,12 @@ pub async fn assert_embedding_model_current(
 ) -> Result<()> {
     let stored_model = db.get_system_metadata("embedding_model").await?;
     let stored_dims = db.get_system_metadata("embedding_dimensions").await?;
-    let current_model = provider.model_name();
+    let current_model = provider.model_ref();
     let current_dims = provider.dimensions().to_string();
 
     match (stored_model, stored_dims) {
         (Some(sm), Some(sd)) if sm == current_model && sd == current_dims => Ok(()),
+        (Some(sm), Some(sd)) if sm == provider.model_name() && sd == current_dims => Ok(()),
         (Some(sm), Some(sd)) => anyhow::bail!(
             "Embedding model changed while embeddings were being generated. \
              Generated: {} ({}d), current metadata: {} ({}d). Retry embed-backfill.",

@@ -1,7 +1,8 @@
-//! Async rate limiting utilities and provider wrappers.
+//! Adaptive provider pressure control and thin provider adapters.
 
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
@@ -9,31 +10,58 @@ use tokio::time::{sleep, Instant};
 use crate::ai::{self, AICompletionRequest, AIConfig, AIProvider, AIResponse, CostTier, Message};
 use crate::embeddings::EmbeddingProvider;
 
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const DEFAULT_SLOW_LATENCY: Duration = Duration::from_secs(45);
+const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
-struct RateLimiterState {
+struct ProviderPressureState {
     next_allowed: Instant,
+    current_interval: Duration,
+    success_streak: u32,
 }
 
-/// Simple interval limiter (requests/minute).
-/// It enforces a minimum delay between requests and is safe for concurrent use.
+/// Adaptive provider pressure limiter.
+///
+/// Existing RPM settings are treated as an initial floor, not as the control
+/// plane. Runtime pressure signals increase the interval; healthy responses
+/// gradually recover toward the initial interval.
 #[derive(Debug)]
-pub struct RateLimiter {
-    min_interval: Duration,
-    state: Mutex<RateLimiterState>,
+pub struct ProviderPressureLimiter {
+    key: String,
+    base_interval: Duration,
+    max_interval: Duration,
+    slow_latency: Duration,
+    state: Mutex<ProviderPressureState>,
 }
 
-impl RateLimiter {
-    pub fn new(requests_per_minute: u32) -> Option<Self> {
-        if requests_per_minute == 0 {
-            return None;
-        }
-        let interval_secs = 60.0 / requests_per_minute as f64;
-        Some(Self {
-            min_interval: Duration::from_secs_f64(interval_secs),
-            state: Mutex::new(RateLimiterState {
+impl ProviderPressureLimiter {
+    pub fn new(key: impl Into<String>, requests_per_minute: Option<u32>) -> Self {
+        Self::with_settings(
+            key,
+            interval_from_rpm(requests_per_minute),
+            DEFAULT_MAX_BACKOFF,
+            DEFAULT_SLOW_LATENCY,
+        )
+    }
+
+    fn with_settings(
+        key: impl Into<String>,
+        base_interval: Duration,
+        max_interval: Duration,
+        slow_latency: Duration,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            base_interval,
+            max_interval: max_interval.max(base_interval),
+            slow_latency,
+            state: Mutex::new(ProviderPressureState {
                 next_allowed: Instant::now(),
+                current_interval: base_interval,
+                success_streak: 0,
             }),
-        })
+        }
     }
 
     pub async fn acquire(&self) {
@@ -42,7 +70,7 @@ impl RateLimiter {
                 let mut state = self.state.lock().await;
                 let now = Instant::now();
                 if state.next_allowed <= now {
-                    state.next_allowed = now + self.min_interval;
+                    state.next_allowed = now + state.current_interval;
                     None
                 } else {
                     Some(state.next_allowed - now)
@@ -55,36 +83,187 @@ impl RateLimiter {
             break;
         }
     }
-}
 
-pub struct RateLimitedAIProvider {
-    inner: Arc<dyn AIProvider>,
-    limiter: Option<Arc<RateLimiter>>,
-}
+    pub async fn record_success(&self, latency: Duration) {
+        let mut state = self.state.lock().await;
+        if latency >= self.slow_latency {
+            state.current_interval = grow_interval(
+                state.current_interval,
+                self.base_interval,
+                self.max_interval,
+                1.25,
+            );
+            state.success_streak = 0;
+            crate::metrics::gauge(
+                "provider_pressure_interval_seconds",
+                state.current_interval.as_secs_f64(),
+                &[("provider", self.key.as_str())],
+            );
+            return;
+        }
 
-impl RateLimitedAIProvider {
-    pub fn new(inner: Arc<dyn AIProvider>, requests_per_minute: Option<u32>) -> Self {
-        let limiter = requests_per_minute.and_then(RateLimiter::new).map(Arc::new);
-        Self { inner, limiter }
+        state.success_streak = state.success_streak.saturating_add(1);
+        if state.success_streak >= 3 && state.current_interval > self.base_interval {
+            state.current_interval = shrink_interval(state.current_interval, self.base_interval);
+            state.success_streak = 0;
+            crate::metrics::gauge(
+                "provider_pressure_interval_seconds",
+                state.current_interval.as_secs_f64(),
+                &[("provider", self.key.as_str())],
+            );
+        }
     }
 
-    async fn wait_for_slot(&self) {
-        if let Some(limiter) = &self.limiter {
-            limiter.acquire().await;
+    pub async fn record_failure(&self, error: &anyhow::Error) {
+        let message = error.to_string();
+        if !is_provider_pressure_error(&message) {
+            return;
+        }
+
+        let requested_delay = retry_after_delay(&message);
+        let mut state = self.state.lock().await;
+        let grown = grow_interval(
+            state.current_interval,
+            self.base_interval.max(MIN_ERROR_BACKOFF),
+            self.max_interval,
+            2.0,
+        );
+        let minimum_delay = self.base_interval.max(MIN_ERROR_BACKOFF);
+        state.current_interval = requested_delay
+            .unwrap_or(grown)
+            .clamp(minimum_delay, self.max_interval.max(minimum_delay));
+        state.next_allowed = Instant::now() + state.current_interval;
+        state.success_streak = 0;
+        crate::metrics::counter(
+            "provider_pressure_backoff_total",
+            1,
+            &[("provider", self.key.as_str())],
+        );
+        crate::metrics::gauge(
+            "provider_pressure_interval_seconds",
+            state.current_interval.as_secs_f64(),
+            &[("provider", self.key.as_str())],
+        );
+    }
+
+    async fn record_outcome(&self, latency: Duration, error: Option<&anyhow::Error>) {
+        if let Some(error) = error {
+            self.record_failure(error).await;
+        } else {
+            self.record_success(latency).await;
         }
     }
 }
 
+fn interval_from_rpm(requests_per_minute: Option<u32>) -> Duration {
+    match requests_per_minute {
+        Some(rpm) if rpm > 0 => Duration::from_secs_f64(60.0 / rpm as f64),
+        _ => Duration::ZERO,
+    }
+}
+
+fn grow_interval(
+    current: Duration,
+    minimum: Duration,
+    maximum: Duration,
+    multiplier: f64,
+) -> Duration {
+    let floor = minimum.max(MIN_ERROR_BACKOFF);
+    let current = current.max(floor);
+    Duration::from_secs_f64((current.as_secs_f64() * multiplier).min(maximum.as_secs_f64()))
+}
+
+fn shrink_interval(current: Duration, base: Duration) -> Duration {
+    if current <= base {
+        return base;
+    }
+    Duration::from_secs_f64((current.as_secs_f64() * 0.85).max(base.as_secs_f64()))
+}
+
+fn is_provider_pressure_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("retry-after")
+        || lower.contains("503")
+        || lower.contains("service unavailable")
+        || lower.contains("resource_exhausted")
+        || lower.contains("quota")
+        || lower.contains("high demand")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+}
+
+fn retry_after_delay(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    let index = lower.find("retry-after")?;
+    let rest = &lower[index + "retry-after".len()..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let secs = digits.parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+static PROVIDER_LIMITERS: OnceLock<StdMutex<HashMap<String, Arc<ProviderPressureLimiter>>>> =
+    OnceLock::new();
+
+fn shared_limiter(key: String, requests_per_minute: Option<u32>) -> Arc<ProviderPressureLimiter> {
+    let registry = PROVIDER_LIMITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = registry.lock().expect("provider limiter registry poisoned");
+    registry
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(ProviderPressureLimiter::new(key, requests_per_minute)))
+        .clone()
+}
+
+fn provider_pressure_key(provider_name: impl Into<String>) -> String {
+    format!("provider:{}", provider_name.into().to_ascii_lowercase())
+}
+
+pub struct PressureLimitedAIProvider {
+    inner: Arc<dyn AIProvider>,
+    limiter: Arc<ProviderPressureLimiter>,
+}
+
+impl PressureLimitedAIProvider {
+    pub fn new(
+        inner: Arc<dyn AIProvider>,
+        provider_name: impl Into<String>,
+        requests_per_minute: Option<u32>,
+    ) -> Self {
+        let limiter = shared_limiter(provider_pressure_key(provider_name), requests_per_minute);
+        Self { inner, limiter }
+    }
+
+    async fn wait_for_slot(&self) {
+        self.limiter.acquire().await;
+    }
+}
+
 #[async_trait::async_trait]
-impl AIProvider for RateLimitedAIProvider {
+impl AIProvider for PressureLimitedAIProvider {
     async fn complete(&self, messages: Vec<Message>) -> Result<AIResponse> {
         self.wait_for_slot().await;
-        self.inner.complete(messages).await
+        let started = Instant::now();
+        let result = self.inner.complete(messages).await;
+        self.limiter
+            .record_outcome(started.elapsed(), result.as_ref().err())
+            .await;
+        result
     }
 
     async fn complete_with_request(&self, request: AICompletionRequest) -> Result<AIResponse> {
         self.wait_for_slot().await;
-        self.inner.complete_with_request(request).await
+        let started = Instant::now();
+        let result = self.inner.complete_with_request(request).await;
+        self.limiter
+            .record_outcome(started.elapsed(), result.as_ref().err())
+            .await;
+        result
     }
 
     fn supports_structured_output(&self) -> bool {
@@ -110,29 +289,36 @@ impl AIProvider for RateLimitedAIProvider {
     }
 }
 
-pub struct RateLimitedEmbeddingProvider {
+pub struct PressureLimitedEmbeddingProvider {
     inner: Arc<dyn EmbeddingProvider>,
-    limiter: Option<Arc<RateLimiter>>,
+    limiter: Arc<ProviderPressureLimiter>,
 }
 
-impl RateLimitedEmbeddingProvider {
-    pub fn new(inner: Arc<dyn EmbeddingProvider>, requests_per_minute: Option<u32>) -> Self {
-        let limiter = requests_per_minute.and_then(RateLimiter::new).map(Arc::new);
+impl PressureLimitedEmbeddingProvider {
+    pub fn new(
+        inner: Arc<dyn EmbeddingProvider>,
+        provider_name: impl Into<String>,
+        requests_per_minute: Option<u32>,
+    ) -> Self {
+        let limiter = shared_limiter(provider_pressure_key(provider_name), requests_per_minute);
         Self { inner, limiter }
     }
 
     async fn wait_for_slot(&self) {
-        if let Some(limiter) = &self.limiter {
-            limiter.acquire().await;
-        }
+        self.limiter.acquire().await;
     }
 }
 
 #[async_trait::async_trait]
-impl EmbeddingProvider for RateLimitedEmbeddingProvider {
+impl EmbeddingProvider for PressureLimitedEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.wait_for_slot().await;
-        self.inner.embed(text).await
+        let started = Instant::now();
+        let result = self.inner.embed(text).await;
+        self.limiter
+            .record_outcome(started.elapsed(), result.as_ref().err())
+            .await;
+        result
     }
 
     fn dimensions(&self) -> usize {
@@ -141,6 +327,10 @@ impl EmbeddingProvider for RateLimitedEmbeddingProvider {
 
     fn model_name(&self) -> &str {
         self.inner.model_name()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
     }
 
     fn is_local(&self) -> bool {
@@ -156,25 +346,26 @@ impl EmbeddingProvider for RateLimitedEmbeddingProvider {
     }
 }
 
-pub fn wrap_ai_provider(
+pub fn wrap_ai_provider_with_pressure(
     provider: Arc<dyn AIProvider>,
+    provider_name: &str,
     requests_per_minute: Option<u32>,
 ) -> Arc<dyn AIProvider> {
-    if requests_per_minute.unwrap_or(0) == 0 {
-        return provider;
-    }
-    Arc::new(RateLimitedAIProvider::new(provider, requests_per_minute))
+    Arc::new(PressureLimitedAIProvider::new(
+        provider,
+        provider_name,
+        requests_per_minute,
+    ))
 }
 
-pub fn wrap_embedding_provider(
+pub fn wrap_embedding_provider_with_pressure(
     provider: Arc<dyn EmbeddingProvider>,
+    provider_name: &str,
     requests_per_minute: Option<u32>,
 ) -> Arc<dyn EmbeddingProvider> {
-    if requests_per_minute.unwrap_or(0) == 0 {
-        return provider;
-    }
-    Arc::new(RateLimitedEmbeddingProvider::new(
+    Arc::new(PressureLimitedEmbeddingProvider::new(
         provider,
+        provider_name,
         requests_per_minute,
     ))
 }
@@ -204,10 +395,11 @@ pub fn wrap_configured_ai_provider(
     provider_name: &str,
     provider: Arc<dyn AIProvider>,
 ) -> Arc<dyn AIProvider> {
-    if provider.is_local() {
-        return provider;
-    }
-    wrap_ai_provider(provider, config.rate_limit_for_provider(provider_name))
+    wrap_ai_provider_with_pressure(
+        provider,
+        provider_name,
+        config.rate_limit_for_provider(provider_name),
+    )
 }
 
 pub fn build_local_ai_provider(config: &AIConfig) -> Option<Arc<dyn AIProvider>> {
@@ -259,13 +451,35 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rate_limiter_enforces_interval() {
-        let limiter = RateLimiter::new(120).expect("limiter");
+    async fn provider_pressure_limiter_enforces_initial_interval() {
+        let limiter = ProviderPressureLimiter::with_settings(
+            "test",
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            Duration::from_secs(45),
+        );
         let started = Instant::now();
         limiter.acquire().await;
         limiter.acquire().await;
         let elapsed = started.elapsed();
-        // 120 RPM = 0.5s between requests; allow scheduler jitter.
         assert!(elapsed >= Duration::from_millis(450));
+    }
+
+    #[tokio::test]
+    async fn provider_pressure_limiter_backs_off_on_pressure_error() {
+        let limiter = ProviderPressureLimiter::with_settings(
+            "test",
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_secs(45),
+        );
+
+        limiter
+            .record_failure(&anyhow::anyhow!("429 Too Many Requests"))
+            .await;
+
+        let started = Instant::now();
+        limiter.acquire().await;
+        assert!(started.elapsed() >= Duration::from_millis(900));
     }
 }

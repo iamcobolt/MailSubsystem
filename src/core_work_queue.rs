@@ -18,7 +18,7 @@ use crate::subagent_runtime;
 use crate::sync_runtime;
 
 const DEFAULT_CORE_LOCATE_LIMIT: usize = 50;
-const DEFAULT_CORE_ANALYZE_LIMIT: usize = 50;
+const DEFAULT_CORE_ANALYZE_PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct CoreCoordinatorConfig {
@@ -31,7 +31,7 @@ pub struct CoreCoordinatorConfig {
     pub claim_lease_secs: i64,
     pub claim_lease_renewal_interval_secs: u64,
     pub retry_after_secs: i64,
-    pub analyze_limit: usize,
+    pub analyze_page_size: usize,
     pub embed_limit: usize,
     pub locate_limit: usize,
     pub file_apply_enabled: bool,
@@ -90,7 +90,8 @@ impl CoreCoordinatorConfig {
             claim_lease_secs,
             claim_lease_renewal_interval_secs,
             retry_after_secs: i64_env("CORE_WORK_RETRY_AFTER_SECS", 60).max(0),
-            analyze_limit: usize_env("CORE_ANALYZE_LIMIT", DEFAULT_CORE_ANALYZE_LIMIT),
+            analyze_page_size: usize_env("CORE_ANALYZE_PAGE_SIZE", DEFAULT_CORE_ANALYZE_PAGE_SIZE)
+                .max(1),
             embed_limit: usize_env("CORE_EMBED_LIMIT", 50),
             locate_limit: usize_env("CORE_LOCATE_LIMIT", DEFAULT_CORE_LOCATE_LIMIT),
             file_apply_enabled: bool_env("CORE_FILE_APPLY"),
@@ -687,14 +688,22 @@ fn follow_up_work_plan(
 ) -> Vec<(CoreWorkType, &'static str)> {
     let mut plan = Vec::new();
 
-    match completed {
-        CoreWorkType::SyncFull | CoreWorkType::SyncIncremental | CoreWorkType::SyncBody => {
-            if snapshot.analysis_missing > 0 {
-                plan.push((CoreWorkType::Analyze, "sync_completed"));
+    if snapshot.analysis_ready > 0 {
+        let reason = match completed {
+            CoreWorkType::SyncFull | CoreWorkType::SyncIncremental | CoreWorkType::SyncBody => {
+                "sync_completed"
             }
-        }
+            _ => "analysis_backlog",
+        };
+        return vec![(CoreWorkType::Analyze, reason)];
+    }
+
+    match completed {
+        CoreWorkType::SyncFull | CoreWorkType::SyncIncremental | CoreWorkType::SyncBody => {}
         CoreWorkType::Analyze => {
-            plan.push((CoreWorkType::Embed, "analysis_completed"));
+            if snapshot.embedding_missing > 0 {
+                plan.push((CoreWorkType::Embed, "analysis_completed"));
+            }
             if snapshot.location_missing > 0 {
                 plan.push((CoreWorkType::Locate, "analysis_completed"));
             }
@@ -718,13 +727,6 @@ fn follow_up_work_plan(
         | CoreWorkType::SubagentTask => {}
     }
 
-    if snapshot.analysis_missing > 0
-        && !plan
-            .iter()
-            .any(|(work_type, _)| *work_type == CoreWorkType::Analyze)
-    {
-        plan.push((CoreWorkType::Analyze, "analysis_backlog"));
-    }
     if snapshot.embedding_missing > 0
         && !plan
             .iter()
@@ -767,8 +769,9 @@ fn idle_work_plan(
     {
         plan.push((CoreWorkType::SyncBody, "body_backlog"));
     }
-    if snapshot.analysis_missing > 0 {
+    if snapshot.analysis_ready > 0 {
         plan.push((CoreWorkType::Analyze, "analysis_backlog"));
+        return plan;
     }
     if snapshot.embedding_missing > 0 {
         plan.push((CoreWorkType::Embed, "embedding_backlog"));
@@ -821,46 +824,9 @@ async fn enqueue_core_work(
         return Ok(());
     }
 
-    let source = payload
-        .get("requested_by")
-        .and_then(|value| value.as_str())
-        .or_else(|| payload.get("source").and_then(|value| value.as_str()))
-        .unwrap_or("system")
-        .to_string();
-    let reason = payload
-        .get("reason")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unspecified")
-        .to_string();
-    match db
-        .try_enqueue_core_work_for_account(
-            account_id,
-            work_type,
-            idempotency_key,
-            payload,
-            db::CoreWorkBackpressureConfig::from_env(),
-        )
+    db.enqueue_core_work_for_account(account_id, work_type, idempotency_key, payload)
         .await
-        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?
-    {
-        db::CoreWorkEnqueueOutcome::Enqueued(_) => {}
-        db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
-            log::warn!(
-                target: "core_work",
-                "{}",
-                serde_json::json!({
-                    "event": "core_work_enqueue_deferred_backpressure",
-                    "account_id": account_id,
-                    "work_type": work_type.as_str(),
-                    "idempotency_key": idempotency_key,
-                    "source": source,
-                    "reason": reason,
-                    "active": pressure.active,
-                    "max_active": pressure.max_active,
-                })
-            );
-        }
-    }
+        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?;
     Ok(())
 }
 
@@ -887,15 +853,9 @@ async fn execute_work(
         }
         CoreWorkType::SyncBody => sync_runtime::run_sync_slow().await,
         CoreWorkType::Analyze => {
-            analysis_commands::run_analyze_with_limit_for_account(
-                None,
-                false,
-                Some(limit_from_payload(
-                    &work.payload,
-                    "limit",
-                    config.analyze_limit,
-                )),
+            analysis_commands::run_analyze_backlog_for_account(
                 &config.account_id,
+                limit_from_payload(&work.payload, "page_size", config.analyze_page_size),
             )
             .await
         }
@@ -970,7 +930,7 @@ async fn execute_assistant_heartbeat(
         .await
         .context("load heartbeat completeness snapshot")?;
 
-    if snapshot.analysis_missing > 0 {
+    if snapshot.analysis_ready > 0 {
         let emails = db
             .get_unanalyzed_emails_for_account(
                 &config.account_id,
@@ -991,6 +951,7 @@ async fn execute_assistant_heartbeat(
                 input_context: json!({
                 "snapshot": {
                     "analysis_missing": snapshot.analysis_missing,
+                    "analysis_ready": snapshot.analysis_ready,
                     "body_missing": snapshot.body_missing,
                 },
                 "instruction": "Classify these messages as structured artifacts only. Do not mutate mailbox state."
@@ -1166,6 +1127,7 @@ mod tests {
     fn follow_up_file_apply_requeues_analysis_when_backlog_remains() {
         let snapshot = db::DbCompletenessSnapshot {
             analysis_missing: 919,
+            analysis_ready: 919,
             ..Default::default()
         };
         assert_eq!(
@@ -1175,9 +1137,24 @@ mod tests {
     }
 
     #[test]
-    fn follow_up_analyze_keeps_locating_and_requeues_analysis_backlog() {
+    fn follow_up_analyze_prioritizes_analysis_backlog_before_downstream_work() {
         let snapshot = db::DbCompletenessSnapshot {
             analysis_missing: 12,
+            analysis_ready: 12,
+            embedding_missing: 9,
+            location_missing: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            follow_up_work_plan(CoreWorkType::Analyze, true, &snapshot),
+            vec![(CoreWorkType::Analyze, "analysis_backlog")]
+        );
+    }
+
+    #[test]
+    fn follow_up_analyze_enqueues_downstream_work_after_analysis_drains() {
+        let snapshot = db::DbCompletenessSnapshot {
+            embedding_missing: 9,
             location_missing: 7,
             ..Default::default()
         };
@@ -1185,8 +1162,25 @@ mod tests {
             follow_up_work_plan(CoreWorkType::Analyze, true, &snapshot),
             vec![
                 (CoreWorkType::Embed, "analysis_completed"),
-                (CoreWorkType::Locate, "analysis_completed"),
-                (CoreWorkType::Analyze, "analysis_backlog")
+                (CoreWorkType::Locate, "analysis_completed")
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_up_analyze_allows_downstream_when_analysis_is_waiting_for_retry() {
+        let snapshot = db::DbCompletenessSnapshot {
+            analysis_missing: 12,
+            analysis_ready: 0,
+            embedding_missing: 9,
+            location_missing: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            follow_up_work_plan(CoreWorkType::Analyze, true, &snapshot),
+            vec![
+                (CoreWorkType::Embed, "analysis_completed"),
+                (CoreWorkType::Locate, "analysis_completed")
             ]
         );
     }
@@ -1238,6 +1232,7 @@ mod tests {
             folder_count: 6,
             email_count: 10,
             analysis_missing: 12,
+            analysis_ready: 12,
             embedding_missing: 5,
             location_missing: 7,
             ..Default::default()
@@ -1247,9 +1242,7 @@ mod tests {
             idle_work_plan(&snapshot, false),
             vec![
                 (CoreWorkType::SyncIncremental, "core_idle_poll"),
-                (CoreWorkType::Analyze, "analysis_backlog"),
-                (CoreWorkType::Embed, "embedding_backlog"),
-                (CoreWorkType::Locate, "location_backlog")
+                (CoreWorkType::Analyze, "analysis_backlog")
             ]
         );
     }

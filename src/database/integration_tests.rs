@@ -1,4 +1,3 @@
-use super::core_work::CoreWorkQueuePressure;
 use super::*;
 use crate::config::DEFAULT_ACCOUNT_ID;
 use crate::database::core_work::CoreWorkQueuePressure;
@@ -33,6 +32,7 @@ fn test_db_completeness_snapshot_backlog_detection() {
         missing_message_id: 0,
         body_missing: 0,
         analysis_missing: 0,
+        analysis_ready: 0,
         embedding_missing: 0,
         location_missing: 0,
         filing_pending: 0,
@@ -1523,6 +1523,55 @@ async fn test_core_work_claim_prioritizes_pipeline_over_subagent_support() {
 
 #[tokio::test]
 #[ignore]
+async fn test_core_work_claim_prioritizes_analysis_over_older_side_work() {
+    let Some(db) = load_test_database().await else {
+        eprintln!(
+            "Skipping core work analysis priority test (no TEST_DATABASE_URL or DATABASE_URL)"
+        );
+        return;
+    };
+
+    let account_id = format!("core-analysis-priority-{}", Uuid::new_v4());
+    cleanup_test_core_work_account(&db, &account_id).await;
+
+    db.enqueue_core_work_for_account(
+        &account_id,
+        CoreWorkType::Locate,
+        "older-locate",
+        serde_json::json!({"reason": "priority_test"}),
+    )
+    .await
+    .expect("enqueue older locate work");
+    sqlx::query(
+        "UPDATE core_work_queue SET available_at = NOW() - INTERVAL '10 minutes' WHERE account_id = $1 AND idempotency_key = 'older-locate'",
+    )
+    .bind(&account_id)
+    .execute(&db.pool)
+    .await
+    .expect("age locate work");
+
+    db.enqueue_core_work_for_account(
+        &account_id,
+        CoreWorkType::Analyze,
+        "newer-analyze",
+        serde_json::json!({"reason": "priority_test"}),
+    )
+    .await
+    .expect("enqueue newer analyze work");
+
+    let claimed = db
+        .claim_core_work_for_account(&account_id, "analysis-priority-worker")
+        .await
+        .expect("claim work")
+        .expect("work row");
+
+    assert_eq!(claimed.work_type, CoreWorkType::Analyze);
+
+    cleanup_test_core_work_account(&db, &account_id).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_core_work_completion_requires_current_claim_lease() {
     let Some(db) = load_test_database().await else {
         eprintln!("Skipping core work claim lease test (no TEST_DATABASE_URL or DATABASE_URL)");
@@ -1596,64 +1645,6 @@ async fn test_core_work_completion_requires_current_claim_lease() {
         row.get::<Option<DateTime<Utc>>, _>("lease_expires_at"),
         None
     );
-
-    cleanup_test_core_work_account(&db, &account_id).await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn test_core_work_enqueue_backpressure_rejects_new_active_rows() {
-    let Some(db) = load_test_database().await else {
-        eprintln!("Skipping core work backpressure test (no TEST_DATABASE_URL or DATABASE_URL)");
-        return;
-    };
-
-    let account_id = format!("core-backpressure-{}", Uuid::new_v4());
-    cleanup_test_core_work_account(&db, &account_id).await;
-    let backpressure = CoreWorkBackpressureConfig { max_active: 1 };
-
-    let first = db
-        .try_enqueue_core_work_for_account(
-            &account_id,
-            CoreWorkType::Analyze,
-            "first",
-            serde_json::json!({"reason": "backpressure_test"}),
-            backpressure,
-        )
-        .await
-        .expect("enqueue first work");
-    assert!(matches!(first, CoreWorkEnqueueOutcome::Enqueued(_)));
-
-    let second = db
-        .try_enqueue_core_work_for_account(
-            &account_id,
-            CoreWorkType::Embed,
-            "second",
-            serde_json::json!({"reason": "backpressure_test"}),
-            backpressure,
-        )
-        .await
-        .expect("backpressure second work");
-    assert!(matches!(
-        second,
-        CoreWorkEnqueueOutcome::Backpressured(CoreWorkQueuePressure {
-            active: 1,
-            max_active: 1,
-            backpressured: true
-        })
-    ));
-
-    let existing = db
-        .try_enqueue_core_work_for_account(
-            &account_id,
-            CoreWorkType::Analyze,
-            "first",
-            serde_json::json!({"reason": "backpressure_existing_update"}),
-            backpressure,
-        )
-        .await
-        .expect("existing active work can be refreshed");
-    assert!(matches!(existing, CoreWorkEnqueueOutcome::Enqueued(_)));
 
     cleanup_test_core_work_account(&db, &account_id).await;
 }
