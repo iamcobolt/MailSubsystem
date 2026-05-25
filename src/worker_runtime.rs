@@ -529,13 +529,35 @@ async fn enqueue_conflict_review_if_needed(
 
     db.upsert_subagent_task_for_account(account_id, &review_task, None, "pending")
         .await?;
-    db.enqueue_core_work_for_account(
-        account_id,
-        CoreWorkType::SubagentTask,
-        &review_task.task_id,
-        subagent_payload_from_record(&review_task, "worker_result_requires_review"),
-    )
-    .await?;
+    let payload = subagent_payload_from_record(&review_task, "worker_result_requires_review");
+    match db
+        .try_enqueue_core_work_for_account(
+            account_id,
+            CoreWorkType::SubagentTask,
+            &review_task.task_id,
+            payload,
+            db::CoreWorkBackpressureConfig::from_env(),
+        )
+        .await?
+    {
+        db::CoreWorkEnqueueOutcome::Enqueued(_) => {}
+        db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+            log::warn!(
+                target: "core_work",
+                "{}",
+                serde_json::json!({
+                    "event": "subagent_review_enqueue_deferred_backpressure",
+                    "account_id": account_id,
+                    "work_type": CoreWorkType::SubagentTask.as_str(),
+                    "idempotency_key": review_task.task_id,
+                    "source": DEFAULT_CREATED_BY,
+                    "reason": "worker_result_requires_review",
+                    "active": pressure.active,
+                    "max_active": pressure.max_active,
+                })
+            );
+        }
+    }
     Ok(())
 }
 
