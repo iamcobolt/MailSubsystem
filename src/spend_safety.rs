@@ -14,21 +14,16 @@ pub const DEFAULT_SPEND_AUDIT_LOG_PATH: &str = "logs/spend_approval_audit.jsonl"
 pub const DEFAULT_SPEND_CURRENCY: &str = "USD";
 pub const DEFAULT_PANIC_WINDOW_SECS: u64 = 300;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpendApprovalMode {
     /// Record estimates and decisions, but do not block requests.
+    #[default]
     AuditOnly,
     /// Interactive surfaces should ask before continuing.
     Prompt,
     /// Non-interactive callers must provide a prior approval token.
     Enforce,
-}
-
-impl Default for SpendApprovalMode {
-    fn default() -> Self {
-        Self::AuditOnly
-    }
 }
 
 impl FromStr for SpendApprovalMode {
