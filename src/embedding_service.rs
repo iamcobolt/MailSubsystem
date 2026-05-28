@@ -366,22 +366,68 @@ fn env_non_empty(name: &str) -> Option<String> {
 }
 
 fn has_gemini_embedding_config() -> bool {
-    env_non_empty("GEMINI_API_KEY").is_some() || env_non_empty("EMBEDDING_GEMINI_MODEL").is_some()
+    has_gemini_embedding_config_values(
+        env_non_empty("EMBEDDING_API_KEY").as_deref(),
+        env_non_empty("GEMINI_API_KEY").as_deref(),
+        env_non_empty("EMBEDDING_GEMINI_MODEL").as_deref(),
+    )
+}
+
+fn has_non_empty_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
+
+fn has_gemini_embedding_config_values(
+    embedding_api_key: Option<&str>,
+    gemini_api_key: Option<&str>,
+    embedding_gemini_model: Option<&str>,
+) -> bool {
+    has_non_empty_value(embedding_api_key)
+        || has_non_empty_value(gemini_api_key)
+        || has_non_empty_value(embedding_gemini_model)
+}
+
+fn embedding_model_ref_provider(value: &str) -> Option<&str> {
+    let (provider, _) = value.trim().split_once('/')?;
+    let provider = provider.trim();
+    let choice = EmbeddingProviderChoice::from_provider_name(provider, "EMBEDDING_MODEL").ok()?;
+    match choice {
+        EmbeddingProviderChoice::Local
+        | EmbeddingProviderChoice::Gemini
+        | EmbeddingProviderChoice::OpenAI => Some(provider),
+        EmbeddingProviderChoice::Auto => None,
+    }
 }
 
 fn embedding_model_ref_from_env() -> Result<Option<ModelRef>> {
     let Some(value) = env_non_empty("EMBEDDING_MODEL") else {
         return Ok(None);
     };
-    if value.contains('/') {
-        Ok(Some(ModelRef::parse(&value, "EMBEDDING_MODEL")?))
+    embedding_model_ref_from_value(&value)
+}
+
+fn embedding_model_ref_from_value(value: &str) -> Result<Option<ModelRef>> {
+    if embedding_model_ref_provider(value).is_some() {
+        Ok(Some(ModelRef::parse(value, "EMBEDDING_MODEL")?))
     } else {
         Ok(None)
     }
 }
 
 fn plain_embedding_model_from_env() -> Option<String> {
-    env_non_empty("EMBEDDING_MODEL").filter(|value| !value.contains('/'))
+    env_non_empty("EMBEDDING_MODEL").and_then(|value| plain_embedding_model_from_value(&value))
+}
+
+fn plain_embedding_model_from_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || embedding_model_ref_provider(value).is_some() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 async fn create_local_embedding_provider(
@@ -739,5 +785,42 @@ mod tests {
         let out = clean_email_body_text("a b c d e f g", 5);
         assert!(out.chars().count() <= 8);
         assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn parses_embedding_model_refs_only_for_known_provider_prefixes() {
+        let model_ref = embedding_model_ref_from_value("omlx/snowflake-arctic-embed-l").unwrap();
+        let model_ref = model_ref.unwrap();
+        assert_eq!(model_ref.provider(), "omlx");
+        assert_eq!(model_ref.model(), "snowflake-arctic-embed-l");
+
+        let namespaced_local = "sentence-transformers/all-MiniLM-L6-v2";
+        assert!(embedding_model_ref_from_value(namespaced_local)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            plain_embedding_model_from_value(namespaced_local),
+            Some(namespaced_local.to_string())
+        );
+    }
+
+    #[test]
+    fn detects_gemini_embedding_config_from_generic_embedding_api_key() {
+        assert!(has_gemini_embedding_config_values(
+            Some("embedding-key"),
+            None,
+            None
+        ));
+        assert!(has_gemini_embedding_config_values(
+            None,
+            Some("gemini-key"),
+            None
+        ));
+        assert!(has_gemini_embedding_config_values(
+            None,
+            None,
+            Some("gemini-embedding-001")
+        ));
+        assert!(!has_gemini_embedding_config_values(None, None, None));
     }
 }

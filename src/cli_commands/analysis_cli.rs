@@ -517,6 +517,21 @@ struct AnalyzeRecordOutcome {
     message_id: String,
     error: Option<anyhow::Error>,
     transient: bool,
+    durable_progress: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AnalyzeBatchSummary {
+    candidates: usize,
+    succeeded: usize,
+    failed: usize,
+    durable_progress: usize,
+}
+
+impl AnalyzeBatchSummary {
+    fn made_durable_progress(self) -> bool {
+        self.durable_progress > 0
+    }
 }
 
 fn is_transient_analysis_error(message: &str) -> bool {
@@ -527,6 +542,70 @@ fn is_transient_analysis_error(message: &str) -> bool {
         || message.contains("RESOURCE_EXHAUSTED")
         || message.contains("quota")
         || message.contains("high demand")
+}
+
+async fn record_analysis_failure_for_account(
+    db: &db::Database,
+    account_id: &str,
+    email: &db::EmailRecord,
+    message: &str,
+    max_analysis_attempts: i32,
+) -> bool {
+    if let Err(db_err) = db
+        .record_analysis_attempt_failed_for_account(account_id, &email.message_id, message)
+        .await
+    {
+        log::warn!(
+            "[analyze] failed to record attempt for {}: {}",
+            email.message_id,
+            db_err
+        );
+        return false;
+    }
+
+    let attempts = email.analysis_attempts + 1;
+    if attempts >= max_analysis_attempts {
+        log::error!(
+            "[analyze] permanent failure for {} after {} attempts",
+            email.message_id,
+            attempts
+        );
+        if let Err(db_err) = db
+            .mark_analysis_permanent_failure_for_account(account_id, &email.message_id)
+            .await
+        {
+            log::error!(
+                "[analyze] failed to mark permanent failure for {}: {}",
+                email.message_id,
+                db_err
+            );
+        }
+    }
+
+    true
+}
+
+fn ensure_analysis_backlog_page_made_progress(
+    summary: AnalyzeBatchSummary,
+    emails: &[db::EmailRecord],
+) -> anyhow::Result<()> {
+    if summary.candidates == 0 || summary.made_durable_progress() {
+        return Ok(());
+    }
+
+    let message_ids = emails
+        .iter()
+        .take(10)
+        .map(|email| email.message_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if emails.len() > 10 { ", ..." } else { "" };
+    anyhow::bail!(
+        "analysis backlog made no durable progress for {} candidate email(s): {}{}",
+        summary.candidates,
+        message_ids,
+        suffix
+    )
 }
 
 async fn analyze_one_record_for_account(
@@ -554,80 +633,98 @@ async fn analyze_one_record_for_account(
             )
             .await
             {
-                log::error!("[analyze] failed to save {}: {}", message_id, e);
+                let msg = e.to_string();
+                let detail = format_error_chain(&e);
+                log::error!("[analyze] failed to save {}: {}", message_id, detail);
                 metrics::counter("analysis_save_failed_total", 1, &[]);
-            } else {
-                if result.queued_for_frontier {
-                    match db
-                        .enqueue_frontier_analysis_for_account(account_id, &message_id)
-                        .await
-                    {
-                        Ok(_) => {
-                            if single {
-                                println!("Analyzed (local, queued for frontier): {}", message_id);
-                            }
-                            metrics::counter("analysis_queued_for_frontier_total", 1, &[]);
+                let transient = is_transient_analysis_error(&msg);
+                if transient {
+                    log::error!("[analyze] stopping analysis: {}", msg);
+                }
+                let durable_progress = record_analysis_failure_for_account(
+                    db.as_ref(),
+                    account_id,
+                    &email,
+                    &msg,
+                    max_analysis_attempts,
+                )
+                .await;
+                return AnalyzeRecordOutcome {
+                    message_id,
+                    error: Some(e.context("failed to save analysis result")),
+                    transient,
+                    durable_progress,
+                };
+            }
+            if result.queued_for_frontier {
+                match db
+                    .enqueue_frontier_analysis_for_account(account_id, &message_id)
+                    .await
+                {
+                    Ok(_) => {
+                        if single {
+                            println!("Analyzed (local, queued for frontier): {}", message_id);
                         }
-                        Err(e) => {
-                            log::warn!(
-                                "[analyze] failed to enqueue {} for frontier: {}",
-                                message_id,
-                                e
-                            );
-                            if single {
-                                println!("Analyzed (local): {}", message_id);
-                            }
-                        }
+                        metrics::counter("analysis_queued_for_frontier_total", 1, &[]);
                     }
-                } else {
-                    if single {
-                        println!("Analyzed: {}", message_id);
+                    Err(e) => {
+                        log::warn!(
+                            "[analyze] failed to enqueue {} for frontier: {}",
+                            message_id,
+                            e
+                        );
+                        if single {
+                            println!("Analyzed (local): {}", message_id);
+                        }
                     }
                 }
-                metrics::counter("analysis_success_total", 1, &[]);
-                metrics::histogram(
-                    "analysis_latency_seconds",
-                    started.elapsed().as_secs_f64(),
-                    &[],
-                );
-                if single {
-                    if let Some(ref by) = result.analyzed_by {
-                        println!("  analyzed_by: {}", by);
-                    }
-                    if let Some(ref u) = result.token_usage {
-                        let total = u
-                            .total_tokens()
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "?".into());
-                        println!(
-                            "  tokens: in={:?} out={:?} total={}",
-                            u.input_tokens, u.output_tokens, total,
-                        );
-                    }
+            } else if single {
+                println!("Analyzed: {}", message_id);
+            }
+            metrics::counter("analysis_success_total", 1, &[]);
+            metrics::histogram(
+                "analysis_latency_seconds",
+                started.elapsed().as_secs_f64(),
+                &[],
+            );
+            if single {
+                if let Some(ref by) = result.analyzed_by {
+                    println!("  analyzed_by: {}", by);
+                }
+                if let Some(ref u) = result.token_usage {
+                    let total = u
+                        .total_tokens()
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "?".into());
                     println!(
-                        "  spam={:?} phishing={:?} marketing={:?} otp={:?} category={:?} org={:?} type={:?}",
-                        result.spam_status,
-                        result.phishing_status,
-                        result.marketing_status,
-                        result.otp_status,
-                        result.category,
-                        result.organization,
-                        result.email_type,
+                        "  tokens: in={:?} out={:?} total={}",
+                        u.input_tokens, u.output_tokens, total,
                     );
-                    if let Some(s) = result.human_summary.as_deref() {
-                        let preview = if s.len() > 80 {
-                            format!("{}...", &s[..77])
-                        } else {
-                            s.to_string()
-                        };
-                        println!("  summary: {}", preview);
-                    }
+                }
+                println!(
+                    "  spam={:?} phishing={:?} marketing={:?} otp={:?} category={:?} org={:?} type={:?}",
+                    result.spam_status,
+                    result.phishing_status,
+                    result.marketing_status,
+                    result.otp_status,
+                    result.category,
+                    result.organization,
+                    result.email_type,
+                );
+                if let Some(s) = result.human_summary.as_deref() {
+                    let preview = if s.len() > 80 {
+                        format!("{}...", &s[..77])
+                    } else {
+                        s.to_string()
+                    };
+                    println!("  summary: {}", preview);
                 }
             }
             AnalyzeRecordOutcome {
                 message_id,
                 error: None,
                 transient: false,
+                durable_progress: true,
             }
         }
         Err(e) => {
@@ -638,41 +735,21 @@ async fn analyze_one_record_for_account(
             if transient {
                 log::error!("[analyze] stopping analysis: {}", msg);
             }
-            if let Err(db_err) = db
-                .record_analysis_attempt_failed_for_account(account_id, &message_id, &msg)
-                .await
-            {
-                log::warn!(
-                    "[analyze] failed to record attempt for {}: {}",
-                    message_id,
-                    db_err
-                );
-            } else {
-                let attempts = email.analysis_attempts + 1;
-                if attempts >= max_analysis_attempts {
-                    log::error!(
-                        "[analyze] permanent failure for {} after {} attempts",
-                        message_id,
-                        attempts
-                    );
-                    if let Err(db_err) = db
-                        .mark_analysis_permanent_failure_for_account(account_id, &message_id)
-                        .await
-                    {
-                        log::error!(
-                            "[analyze] failed to mark permanent failure for {}: {}",
-                            message_id,
-                            db_err
-                        );
-                    }
-                }
-            }
+            let durable_progress = record_analysis_failure_for_account(
+                db.as_ref(),
+                account_id,
+                &email,
+                &msg,
+                max_analysis_attempts,
+            )
+            .await;
             let detail = format_error_chain(&e);
             log::warn!("[analyze] failed {}: {}", message_id, detail);
             AnalyzeRecordOutcome {
                 message_id,
                 error: Some(e),
                 transient,
+                durable_progress,
             }
         }
     }
@@ -686,11 +763,13 @@ async fn analyze_records_for_account(
     max_analysis_attempts: i32,
     worker_instructions: Option<&HashMap<String, String>>,
     analysis_concurrency: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AnalyzeBatchSummary> {
     let single = emails.len() == 1;
     let mut first_error: Option<anyhow::Error> = None;
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
+    let mut summary = AnalyzeBatchSummary {
+        candidates: emails.len(),
+        ..Default::default()
+    };
 
     let concurrency = if single {
         1
@@ -717,8 +796,11 @@ async fn analyze_records_for_account(
                 single,
             )
             .await;
+            if outcome.durable_progress {
+                summary.durable_progress += 1;
+            }
             if let Some(error) = outcome.error {
-                failed += 1;
+                summary.failed += 1;
                 if outcome.transient {
                     return Err(error);
                 }
@@ -726,7 +808,7 @@ async fn analyze_records_for_account(
                     first_error = Some(error);
                 }
             } else {
-                succeeded += 1;
+                summary.succeeded += 1;
             }
         }
     } else {
@@ -754,8 +836,11 @@ async fn analyze_records_for_account(
         .await;
 
         for outcome in outcomes {
+            if outcome.durable_progress {
+                summary.durable_progress += 1;
+            }
             if let Some(error) = outcome.error {
-                failed += 1;
+                summary.failed += 1;
                 if outcome.transient {
                     return Err(error);
                 }
@@ -767,16 +852,16 @@ async fn analyze_records_for_account(
                     first_error = Some(error);
                 }
             } else {
-                succeeded += 1;
+                summary.succeeded += 1;
             }
         }
     }
     if !single {
         println!(
             "Analyzed {} of {} email(s) ({} failed)",
-            succeeded,
+            summary.succeeded,
             emails.len(),
-            failed
+            summary.failed
         );
     }
     if single {
@@ -784,7 +869,7 @@ async fn analyze_records_for_account(
             return Err(err).context("single-message analyze failed");
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 pub async fn run_analyze(message_id: Option<String>, force: bool) -> anyhow::Result<()> {
@@ -854,6 +939,7 @@ pub async fn run_analyze_with_limit_for_account(
         runtime.analysis_concurrency,
     )
     .await
+    .map(|_| ())
 }
 
 pub async fn run_analyze_backlog_for_account(
@@ -864,7 +950,7 @@ pub async fn run_analyze_backlog_for_account(
     let limit = page_size as u32;
     let runtime = build_analyze_runtime_context(account_id).await?;
     let db = runtime.db.clone();
-    let mut total_analyzed = 0usize;
+    let mut total_progressed = 0usize;
 
     loop {
         let emails = db
@@ -880,8 +966,7 @@ pub async fn run_analyze_backlog_for_account(
             emails.len(),
             page_size
         );
-        let count = emails.len();
-        analyze_records_for_account(
+        let summary = analyze_records_for_account(
             db.clone(),
             &runtime.analyzer,
             account_id,
@@ -891,12 +976,13 @@ pub async fn run_analyze_backlog_for_account(
             runtime.analysis_concurrency,
         )
         .await?;
-        total_analyzed += count;
+        ensure_analysis_backlog_page_made_progress(summary, &emails)?;
+        total_progressed += summary.durable_progress;
     }
 
     println!(
-        "Analysis backlog pass complete after {} candidate email(s)",
-        total_analyzed
+        "Analysis backlog pass complete after {} durable progress record(s)",
+        total_progressed
     );
     Ok(())
 }
@@ -1293,6 +1379,33 @@ mod tests {
             instructions.get("id-1"),
             Some(&"review links carefully".to_string())
         );
+    }
+
+    #[test]
+    fn backlog_progress_guard_rejects_pages_without_durable_progress() {
+        let emails = vec![test_email_record("id-1")];
+        let summary = AnalyzeBatchSummary {
+            candidates: 1,
+            failed: 1,
+            ..Default::default()
+        };
+
+        let err = ensure_analysis_backlog_page_made_progress(summary, &emails).unwrap_err();
+        assert!(err.to_string().contains("no durable progress"));
+        assert!(err.to_string().contains("id-1"));
+    }
+
+    #[test]
+    fn backlog_progress_guard_accepts_durable_progress() {
+        let emails = vec![test_email_record("id-1")];
+        let summary = AnalyzeBatchSummary {
+            candidates: 1,
+            failed: 1,
+            durable_progress: 1,
+            ..Default::default()
+        };
+
+        ensure_analysis_backlog_page_made_progress(summary, &emails).unwrap();
     }
 
     #[test]
