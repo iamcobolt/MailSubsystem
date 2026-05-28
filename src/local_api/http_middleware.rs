@@ -264,20 +264,29 @@ fn is_security_exempt(method: &Method, path: &str) -> bool {
 }
 
 fn required_scope(method: &Method, path: &str) -> Option<ApiScope> {
-    if !is_dashboard_path(path) {
+    if is_security_exempt(method, path) {
         return None;
     }
 
-    if method == Method::GET || method == Method::HEAD {
+    let path = normalized_api_path(path);
+    if is_read_method(method) && is_read_api_path(path) {
         Some(ApiScope::DashboardRead)
     } else {
         Some(ApiScope::DashboardAdmin)
     }
 }
 
-fn is_dashboard_path(path: &str) -> bool {
-    let path = normalized_api_path(path);
-    path == "status" || path == "stats" || path == "runs" || path.starts_with("runs/")
+fn is_read_method(method: &Method) -> bool {
+    method == Method::GET || method == Method::HEAD
+}
+
+fn is_read_api_path(path: &str) -> bool {
+    matches!(
+        path,
+        "agents" | "emails" | "folders" | "runs" | "stats" | "status" | "threads"
+    ) || path.starts_with("emails/")
+        || path.starts_with("runs/")
+        || (path.starts_with("threads/") && path.ends_with("/messages"))
 }
 
 fn normalized_api_path(path: &str) -> &str {
@@ -406,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_routes_require_dashboard_scope() {
+    fn api_routes_require_read_or_admin_scope() {
         assert_eq!(
             required_scope(&Method::GET, "/api/status"),
             Some(ApiScope::DashboardRead)
@@ -416,15 +425,54 @@ mod tests {
             Some(ApiScope::DashboardRead)
         );
         assert_eq!(
+            required_scope(&Method::GET, "/api/agents"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/emails"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/emails/message-1"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/folders"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
             required_scope(&Method::GET, "/api/runs/run-1"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/threads"),
+            Some(ApiScope::DashboardRead)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/threads/thread-1/messages"),
             Some(ApiScope::DashboardRead)
         );
         assert_eq!(
             required_scope(&Method::POST, "/api/status"),
             Some(ApiScope::DashboardAdmin)
         );
+        assert_eq!(
+            required_scope(&Method::POST, "/api/chat"),
+            Some(ApiScope::DashboardAdmin)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/chat/stream"),
+            Some(ApiScope::DashboardAdmin)
+        );
+        assert_eq!(
+            required_scope(&Method::DELETE, "/api/threads/thread-1"),
+            Some(ApiScope::DashboardAdmin)
+        );
+        assert_eq!(
+            required_scope(&Method::GET, "/api/new-route"),
+            Some(ApiScope::DashboardAdmin)
+        );
         assert_eq!(required_scope(&Method::GET, "/api/health"), None);
-        assert_eq!(required_scope(&Method::GET, "/api/emails"), None);
     }
 
     #[test]
@@ -432,6 +480,71 @@ mod tests {
         assert!(is_security_exempt(&Method::GET, "/api/health"));
         assert!(is_security_exempt(&Method::OPTIONS, "/api/stats"));
         assert!(!is_security_exempt(&Method::GET, "/api/stats"));
+    }
+
+    #[test]
+    fn dashboard_read_scope_cannot_start_chat_or_delete_threads() {
+        let read_only = ApiPrincipal {
+            rate_limit_key: "test".to_string(),
+            scopes: ApiScopes::from_scope_names(vec!["dashboard:read".to_string()])
+                .expect("read-only scopes"),
+        };
+
+        for (method, path) in [
+            (Method::POST, "/api/chat"),
+            (Method::GET, "/api/chat/stream"),
+            (Method::DELETE, "/api/threads/thread-1"),
+        ] {
+            let scope = required_scope(&method, path).expect("route should require a scope");
+            assert!(
+                !read_only.allows(scope),
+                "dashboard:read unexpectedly allowed {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_read_scope_allows_read_endpoints() {
+        let read_only = ApiPrincipal {
+            rate_limit_key: "test".to_string(),
+            scopes: ApiScopes::from_scope_names(vec!["dashboard:read".to_string()])
+                .expect("read-only scopes"),
+        };
+
+        for (method, path) in [
+            (Method::GET, "/api/status"),
+            (Method::GET, "/api/emails"),
+            (Method::GET, "/api/threads"),
+            (Method::GET, "/api/runs/run-1"),
+            (Method::HEAD, "/api/stats"),
+        ] {
+            let scope = required_scope(&method, path).expect("route should require a scope");
+            assert!(
+                read_only.allows(scope),
+                "dashboard:read unexpectedly denied {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_admin_scope_allows_mutating_routes() {
+        let admin = ApiPrincipal {
+            rate_limit_key: "test".to_string(),
+            scopes: ApiScopes::from_scope_names(vec!["dashboard:admin".to_string()])
+                .expect("admin scopes"),
+        };
+
+        for (method, path) in [
+            (Method::POST, "/api/chat"),
+            (Method::GET, "/api/chat/stream"),
+            (Method::DELETE, "/api/threads/thread-1"),
+        ] {
+            let scope = required_scope(&method, path).expect("route should require a scope");
+            assert!(
+                admin.allows(scope),
+                "dashboard:admin unexpectedly denied {method} {path}"
+            );
+        }
     }
 
     #[test]
