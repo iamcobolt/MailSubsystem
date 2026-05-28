@@ -7,7 +7,7 @@ use anyhow::Context;
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::sleep;
 
 use crate::commands::{analysis_commands, location_commands};
@@ -28,6 +28,8 @@ pub struct CoreCoordinatorConfig {
     pub background_sync_enabled: bool,
     pub background_sync_interval_secs: u64,
     pub stale_after_secs: i64,
+    pub claim_lease_secs: i64,
+    pub claim_lease_renewal_interval_secs: u64,
     pub retry_after_secs: i64,
     pub analyze_limit: usize,
     pub embed_limit: usize,
@@ -65,6 +67,16 @@ impl CoreCoordinatorConfig {
                 .unwrap_or(default_value)
         };
 
+        let stale_after_secs = i64_env("CORE_WORK_STALE_AFTER_SECS", 600).max(1);
+        let claim_lease_secs = i64_env("CORE_WORK_LEASE_SECS", stale_after_secs).max(1);
+        let claim_lease_renewal_interval_secs = clamp_core_work_lease_renewal_interval_secs(
+            claim_lease_secs,
+            u64_env(
+                "CORE_WORK_LEASE_RENEWAL_INTERVAL_SECS",
+                default_core_work_lease_renewal_interval_secs(claim_lease_secs),
+            ),
+        );
+
         Self {
             account_id: std::env::var("CORE_ACCOUNT_ID")
                 .unwrap_or_else(|_| DEFAULT_ACCOUNT_ID.to_string()),
@@ -74,7 +86,9 @@ impl CoreCoordinatorConfig {
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
             background_sync_interval_secs: u64_env("CORE_BACKGROUND_SYNC_INTERVAL_SECS", 60).max(5),
-            stale_after_secs: i64_env("CORE_WORK_STALE_AFTER_SECS", 600).max(1),
+            stale_after_secs,
+            claim_lease_secs,
+            claim_lease_renewal_interval_secs,
             retry_after_secs: i64_env("CORE_WORK_RETRY_AFTER_SECS", 60).max(0),
             analyze_limit: usize_env("CORE_ANALYZE_LIMIT", DEFAULT_CORE_ANALYZE_LIMIT),
             embed_limit: usize_env("CORE_EMBED_LIMIT", 50),
@@ -93,6 +107,15 @@ impl CoreCoordinatorConfig {
             subagent_concurrency: usize_env("MAIL_ASSISTANT_SUBAGENT_CONCURRENCY", 4).max(1),
         }
     }
+}
+
+fn default_core_work_lease_renewal_interval_secs(lease_secs: i64) -> u64 {
+    (lease_secs.max(1) as u64 / 3).clamp(1, 60)
+}
+
+fn clamp_core_work_lease_renewal_interval_secs(lease_secs: i64, requested_secs: u64) -> u64 {
+    let max_interval = (lease_secs.max(1) as u64).saturating_sub(1).max(1);
+    requested_secs.max(1).min(max_interval)
 }
 
 pub async fn run_core_coordinator_with_config(
@@ -190,10 +213,12 @@ async fn run_core_coordinator_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     log::info!(
-        "[core] coordinator started account={} worker={} poll={}s background_sync={} background_sync_interval={}s file_apply={}",
+        "[core] coordinator started account={} worker={} poll={}s lease={}s renew={}s background_sync={} background_sync_interval={}s file_apply={}",
         config.account_id,
         config.worker_id,
         config.poll_interval_secs,
+        config.claim_lease_secs,
+        config.claim_lease_renewal_interval_secs,
         config.background_sync_enabled,
         config.background_sync_interval_secs,
         config.file_apply_enabled
@@ -412,7 +437,11 @@ async fn run_once(db: &Arc<db::Database>, config: &CoreCoordinatorConfig) -> any
     }
 
     let Some(work) = db
-        .claim_core_work_for_account(&config.account_id, &config.worker_id)
+        .claim_core_work_with_lease_for_account(
+            &config.account_id,
+            &config.worker_id,
+            config.claim_lease_secs,
+        )
         .await
         .context("claim core work")?
     else {
@@ -428,11 +457,12 @@ async fn run_once(db: &Arc<db::Database>, config: &CoreCoordinatorConfig) -> any
         let remaining = config.subagent_concurrency.saturating_sub(1);
         if remaining > 0 {
             let more = db
-                .claim_core_work_batch_for_account(
+                .claim_core_work_batch_with_lease_for_account(
                     &config.account_id,
                     &config.worker_id,
                     CoreWorkType::SubagentTask,
                     remaining,
+                    config.claim_lease_secs,
                 )
                 .await
                 .context("claim subagent work batch")?;
@@ -465,34 +495,121 @@ async fn process_claimed_work(
     let work_id = work.id;
     let work_type = work.work_type;
 
-    match execute_work(db, &work, config).await {
+    match execute_work_with_lease_renewal(db, &work, config).await {
         Ok(()) => {
-            db.mark_core_work_done_for_account(&config.account_id, work_id)
+            let completed = db
+                .mark_claimed_core_work_done_for_account(&config.account_id, &work)
                 .await
                 .context("mark core work done")?;
-            enqueue_follow_up_work(db, config, work_type).await?;
+            if completed {
+                enqueue_follow_up_work(db, config, work_type).await?;
+            } else {
+                log::warn!(
+                    "[core] skipped follow-up for work id={} type={:?}; claim lease was no longer current",
+                    work_id,
+                    work_type
+                );
+            }
         }
         Err(error) => {
             let status = db
-                .mark_core_work_retry_or_dead_for_account(
+                .mark_claimed_core_work_retry_or_dead_for_account(
                     &config.account_id,
-                    work_id,
-                    work.attempt_count,
-                    work.max_attempts,
+                    &work,
                     config.retry_after_secs,
                     &format!("{:#}", error),
                 )
                 .await
                 .context("mark core work failed")?;
+            if let Some(status) = status {
+                log::warn!(
+                    "[core] work id={} type={:?} marked {}: {:#}",
+                    work_id,
+                    work_type,
+                    status,
+                    error
+                );
+            } else {
+                log::warn!(
+                    "[core] work id={} type={:?} failed after its claim lease was lost: {:#}",
+                    work_id,
+                    work_type,
+                    error
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn execute_work_with_lease_renewal(
+    db: &Arc<db::Database>,
+    work: &CoreWorkQueueEntry,
+    config: &CoreCoordinatorConfig,
+) -> anyhow::Result<()> {
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let renew_task = tokio::spawn(run_core_work_lease_renewer(
+        db.clone(),
+        config.account_id.clone(),
+        work.clone(),
+        config.claim_lease_secs,
+        Duration::from_secs(config.claim_lease_renewal_interval_secs),
+        stop_rx,
+    ));
+
+    let result = execute_work(db, work, config).await;
+    let _ = stop_tx.send(());
+    match renew_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
             log::warn!(
-                "[core] work id={} type={:?} marked {}: {:#}",
-                work_id,
-                work_type,
-                status,
+                "[core] lease renewer failed for work id={} type={:?}: {:#}",
+                work.id,
+                work.work_type,
+                error
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "[core] lease renewer task failed for work id={} type={:?}: {}",
+                work.id,
+                work.work_type,
                 error
             );
         }
     }
+
+    result
+}
+
+async fn run_core_work_lease_renewer(
+    db: Arc<db::Database>,
+    account_id: String,
+    work: CoreWorkQueueEntry,
+    lease_secs: i64,
+    interval: Duration,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = sleep(interval) => {}
+            _ = &mut stop_rx => break,
+        }
+
+        let renewed = db
+            .renew_core_work_lease_for_account(&account_id, &work, lease_secs)
+            .await
+            .with_context(|| {
+                format!(
+                    "renew core work lease id={} worker={}",
+                    work.id, work.worker_id
+                )
+            })?;
+        if !renewed {
+            break;
+        }
+    }
+
     Ok(())
 }
 
@@ -704,9 +821,46 @@ async fn enqueue_core_work(
         return Ok(());
     }
 
-    db.enqueue_core_work_for_account(account_id, work_type, idempotency_key, payload)
+    let source = payload
+        .get("requested_by")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("source").and_then(|value| value.as_str()))
+        .unwrap_or("system")
+        .to_string();
+    let reason = payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unspecified")
+        .to_string();
+    match db
+        .try_enqueue_core_work_for_account(
+            account_id,
+            work_type,
+            idempotency_key,
+            payload,
+            db::CoreWorkBackpressureConfig::from_env(),
+        )
         .await
-        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?;
+        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?
+    {
+        db::CoreWorkEnqueueOutcome::Enqueued(_) => {}
+        db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+            log::warn!(
+                target: "core_work",
+                "{}",
+                serde_json::json!({
+                    "event": "core_work_enqueue_deferred_backpressure",
+                    "account_id": account_id,
+                    "work_type": work_type.as_str(),
+                    "idempotency_key": idempotency_key,
+                    "source": source,
+                    "reason": reason,
+                    "active": pressure.active,
+                    "max_active": pressure.max_active,
+                })
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1171,6 +1325,20 @@ mod tests {
             core_runtime_lock_key("default"),
             core_runtime_lock_key("other")
         );
+    }
+
+    #[test]
+    fn lease_renewal_interval_defaults_to_bounded_fraction_of_lease() {
+        assert_eq!(default_core_work_lease_renewal_interval_secs(600), 60);
+        assert_eq!(default_core_work_lease_renewal_interval_secs(30), 10);
+        assert_eq!(default_core_work_lease_renewal_interval_secs(2), 1);
+    }
+
+    #[test]
+    fn lease_renewal_interval_clamps_before_expiry() {
+        assert_eq!(clamp_core_work_lease_renewal_interval_secs(60, 120), 59);
+        assert_eq!(clamp_core_work_lease_renewal_interval_secs(60, 0), 1);
+        assert_eq!(clamp_core_work_lease_renewal_interval_secs(1, 30), 1);
     }
 
     #[test]

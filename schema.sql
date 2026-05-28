@@ -615,6 +615,7 @@ CREATE TABLE IF NOT EXISTS core_work_queue (
     max_attempts INTEGER NOT NULL DEFAULT 3,
     available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     locked_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ,
     worker_id TEXT,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -634,6 +635,7 @@ ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS attempt_count INT
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS worker_id TEXT;
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS last_error TEXT;
 ALTER TABLE IF EXISTS core_work_queue ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
@@ -667,6 +669,7 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_core_work_queue_status_available_at ON core_work_queue(account_id, status, available_at);
 CREATE INDEX IF NOT EXISTS idx_core_work_queue_status_locked_at ON core_work_queue(account_id, status, locked_at);
+CREATE INDEX IF NOT EXISTS idx_core_work_queue_status_lease_expires_at ON core_work_queue(account_id, status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_core_work_queue_work_type_status ON core_work_queue(account_id, work_type, status);
 
 -- Mail Assistant multi-agent runtime: quiet insights, ephemeral sub-agent work, and filing policy history.
