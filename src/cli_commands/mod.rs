@@ -43,6 +43,9 @@ pub async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Analyze { message_id, force } => {
             analysis_commands::run_analyze(message_id, force).await
         }
+        Command::ClassificationEval { corpus } => {
+            analysis_commands::run_classification_eval(corpus).await
+        }
         Command::TestLlm { local, frontier } => {
             analysis_commands::run_test_llm(local, frontier).await
         }

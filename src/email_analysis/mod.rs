@@ -14,11 +14,13 @@ use crate::harness::{
 };
 use crate::rag::{RAGContextBuilder, SimilarSearchHints};
 
+mod classification_eval;
 mod harness_io;
 mod result_normalization;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use classification_eval::run_classification_eval;
 pub use result_normalization::apply_analysis_result_for_account;
 
 use harness_io::{

@@ -26,6 +26,9 @@ pub enum Command {
         message_id: Option<String>,
         force: bool,
     },
+    ClassificationEval {
+        corpus: Option<String>,
+    },
     TestLlm {
         local: bool,
         frontier: bool,
@@ -128,6 +131,7 @@ impl Command {
             Command::CoreStatus => "core-status",
             Command::Tui { .. } => "tui",
             Command::Analyze { .. } => "analyze",
+            Command::ClassificationEval { .. } => "classification-eval",
             Command::TestLlm { local, frontier } => {
                 if *local {
                     "test-llm-local"
@@ -228,6 +232,9 @@ pub fn parse_command(args: &[String]) -> Command {
             };
             Command::Analyze { message_id, force }
         }
+        Some("classification-eval") => Command::ClassificationEval {
+            corpus: arg_value::<String>(args, "--corpus"),
+        },
         Some("test-llm") => Command::TestLlm {
             local: args.iter().any(|a| a == "--local"),
             frontier: args.iter().any(|a| a == "--frontier"),
@@ -360,6 +367,7 @@ pub fn print_usage() {
     );
     println!("  mailsubsystem status  - show imap_folders and emails table state");
     println!("  mailsubsystem analyze [--force] [message_id] - AI analysis (batch or one record)");
+    println!("  mailsubsystem classification-eval [--corpus path] - run fixed classification regression eval corpus");
     println!(
         "  mailsubsystem test-llm --local   - test connection to local LLM (LM Studio / Ollama)"
     );
@@ -457,6 +465,22 @@ mod tests {
                 message_id: Some("message-1".to_string()),
                 force: true,
                 limit: Some(75)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_classification_eval_command_with_corpus() {
+        let args = vec![
+            "mailsubsystem".to_string(),
+            "classification-eval".to_string(),
+            "--corpus".to_string(),
+            "fixtures/classification.json".to_string(),
+        ];
+        assert_eq!(
+            parse_command(&args),
+            Command::ClassificationEval {
+                corpus: Some("fixtures/classification.json".to_string())
             }
         );
     }
