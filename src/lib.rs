@@ -44,6 +44,7 @@ mod rag;
 mod rate_limit;
 #[path = "runtime_task_services.rs"]
 mod runtime_services;
+pub mod spend_safety;
 #[path = "worker_runtime.rs"]
 mod subagent_runtime;
 #[path = "mailbox_sync_runtime.rs"]
