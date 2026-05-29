@@ -317,6 +317,12 @@ enum EmbeddingProviderChoice {
     OpenAI,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEmbeddingProviderRoute {
+    Local,
+    Gemini,
+}
+
 impl EmbeddingProviderChoice {
     fn from_env(model_ref: Option<&ModelRef>) -> Result<Self> {
         if let Some(value) = env_non_empty("EMBEDDING_PROVIDER") {
@@ -365,14 +371,6 @@ fn env_non_empty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn has_gemini_embedding_config() -> bool {
-    has_gemini_embedding_config_values(
-        env_non_empty("EMBEDDING_API_KEY").as_deref(),
-        env_non_empty("GEMINI_API_KEY").as_deref(),
-        env_non_empty("EMBEDDING_GEMINI_MODEL").as_deref(),
-    )
-}
-
 fn has_non_empty_value(value: Option<&str>) -> bool {
     value
         .map(str::trim)
@@ -388,6 +386,33 @@ fn has_gemini_embedding_config_values(
     has_non_empty_value(embedding_api_key)
         || has_non_empty_value(gemini_api_key)
         || has_non_empty_value(embedding_gemini_model)
+}
+
+fn auto_embedding_provider_route(
+    embedding_model: Option<&str>,
+    embedding_base_url: Option<&str>,
+    local_llm_url: Option<&str>,
+    embedding_api_key: Option<&str>,
+    gemini_api_key: Option<&str>,
+    embedding_gemini_model: Option<&str>,
+) -> Option<AutoEmbeddingProviderRoute> {
+    if embedding_model
+        .and_then(plain_embedding_model_from_value)
+        .is_some()
+    {
+        return Some(AutoEmbeddingProviderRoute::Local);
+    }
+
+    if has_gemini_embedding_config_values(embedding_api_key, gemini_api_key, embedding_gemini_model)
+    {
+        return Some(AutoEmbeddingProviderRoute::Gemini);
+    }
+
+    if has_non_empty_value(embedding_base_url) || has_non_empty_value(local_llm_url) {
+        return Some(AutoEmbeddingProviderRoute::Local);
+    }
+
+    None
 }
 
 fn embedding_model_ref_provider(value: &str) -> Option<&str> {
@@ -533,7 +558,8 @@ async fn create_gemini_embedding_provider(
 /// Auto-detect embedding provider from environment configuration.
 /// Probes the model to discover its output dimension.
 /// Prefer EMBEDDING_MODEL=provider/model for provider-agnostic selection.
-/// otherwise Gemini/frontier embeddings win when an embedding API key is present.
+/// Plain EMBEDDING_MODEL values remain local for legacy deployments.
+/// Otherwise Gemini/frontier embeddings win when an embedding API key is present.
 /// Returns an error if no embedding provider can be configured.
 pub async fn create_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
     let model_ref = embedding_model_ref_from_env()?;
@@ -548,11 +574,28 @@ pub async fn create_embedding_provider() -> Result<Box<dyn EmbeddingProvider>> {
             create_openai_embedding_provider(model_ref.as_ref()).await
         }
         EmbeddingProviderChoice::Auto => {
-            if has_gemini_embedding_config() {
-                return create_gemini_embedding_provider(None).await;
-            }
-            if env_non_empty("LOCAL_LLM_URL").is_some() {
-                return create_local_embedding_provider(None).await;
+            let embedding_model = env_non_empty("EMBEDDING_MODEL");
+            let embedding_base_url = env_non_empty("EMBEDDING_BASE_URL");
+            let local_llm_url = env_non_empty("LOCAL_LLM_URL");
+            let embedding_api_key = env_non_empty("EMBEDDING_API_KEY");
+            let gemini_api_key = env_non_empty("GEMINI_API_KEY");
+            let embedding_gemini_model = env_non_empty("EMBEDDING_GEMINI_MODEL");
+
+            match auto_embedding_provider_route(
+                embedding_model.as_deref(),
+                embedding_base_url.as_deref(),
+                local_llm_url.as_deref(),
+                embedding_api_key.as_deref(),
+                gemini_api_key.as_deref(),
+                embedding_gemini_model.as_deref(),
+            ) {
+                Some(AutoEmbeddingProviderRoute::Local) => {
+                    return create_local_embedding_provider(None).await;
+                }
+                Some(AutoEmbeddingProviderRoute::Gemini) => {
+                    return create_gemini_embedding_provider(None).await;
+                }
+                None => {}
             }
             anyhow::bail!(
                 "No embedding provider configured. Set EMBEDDING_MODEL=provider/model, \
@@ -822,5 +865,35 @@ mod tests {
             Some("gemini-embedding-001")
         ));
         assert!(!has_gemini_embedding_config_values(None, None, None));
+    }
+
+    #[test]
+    fn auto_embedding_provider_prefers_plain_local_model_over_gemini_config() {
+        assert_eq!(
+            auto_embedding_provider_route(
+                Some("nomic-embed-text-v1.5"),
+                None,
+                None,
+                Some("embedding-key"),
+                Some("gemini-key"),
+                Some("gemini-embedding-001"),
+            ),
+            Some(AutoEmbeddingProviderRoute::Local)
+        );
+    }
+
+    #[test]
+    fn auto_embedding_provider_uses_gemini_without_plain_local_model() {
+        assert_eq!(
+            auto_embedding_provider_route(
+                None,
+                Some("http://localhost:11434/v1"),
+                None,
+                Some("embedding-key"),
+                None,
+                None,
+            ),
+            Some(AutoEmbeddingProviderRoute::Gemini)
+        );
     }
 }

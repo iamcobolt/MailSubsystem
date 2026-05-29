@@ -115,7 +115,7 @@ impl ProviderPressureLimiter {
     }
 
     pub async fn record_failure(&self, error: &anyhow::Error) {
-        let message = error.to_string();
+        let message = error_chain_message(error);
         if !is_provider_pressure_error(&message) {
             return;
         }
@@ -153,6 +153,14 @@ impl ProviderPressureLimiter {
             self.record_success(latency).await;
         }
     }
+}
+
+fn error_chain_message(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn interval_from_rpm(requests_per_minute: Option<u32>) -> Duration {
@@ -477,6 +485,23 @@ mod tests {
         limiter
             .record_failure(&anyhow::anyhow!("429 Too Many Requests"))
             .await;
+
+        let started = Instant::now();
+        limiter.acquire().await;
+        assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn provider_pressure_limiter_classifies_wrapped_timeout_errors() {
+        let limiter = ProviderPressureLimiter::with_settings(
+            "test",
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_secs(45),
+        );
+        let error = anyhow::anyhow!("operation timed out").context("embedding request failed");
+
+        limiter.record_failure(&error).await;
 
         let started = Instant::now();
         limiter.acquire().await;
