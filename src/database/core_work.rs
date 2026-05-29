@@ -79,6 +79,40 @@ pub struct CoreWorkQueueDepth {
     pub dead: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreWorkBackpressureConfig {
+    pub max_active: i64,
+}
+
+impl CoreWorkBackpressureConfig {
+    pub fn from_env() -> Self {
+        let max_active = std::env::var("CORE_WORK_QUEUE_MAX_ACTIVE")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_CORE_WORK_QUEUE_MAX_ACTIVE)
+            .max(1);
+        Self { max_active }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoreWorkQueuePressure {
+    pub active: i64,
+    pub max_active: i64,
+    pub backpressured: bool,
+}
+
+impl CoreWorkQueuePressure {
+    fn new(active: i64, max_active: i64) -> Self {
+        let max_active = max_active.max(1);
+        Self {
+            active,
+            max_active,
+            backpressured: active >= max_active,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreWorkStatusItem {
     pub id: i64,
@@ -112,6 +146,7 @@ pub struct CoreWorkStatusSummary {
     pub account_id: String,
     pub state: String,
     pub queue_depth: CoreWorkQueueDepth,
+    pub queue_pressure: CoreWorkQueuePressure,
     pub active_work: Vec<CoreWorkStatusItem>,
     pub recent_failures: Vec<CoreWorkStatusItem>,
     pub recent_completed: Vec<CoreWorkStatusItem>,
@@ -119,6 +154,13 @@ pub struct CoreWorkStatusSummary {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreWorkEnqueueOutcome {
+    Enqueued(u64),
+    Backpressured(CoreWorkQueuePressure),
+}
+
+const DEFAULT_CORE_WORK_QUEUE_MAX_ACTIVE: i64 = 10_000;
 const DEFAULT_CORE_WORK_LEASE_SECS: i64 = 600;
 
 fn core_work_claim_lease_secs_from_env() -> i64 {
@@ -136,6 +178,10 @@ fn payload_text(payload: &Value, key: &str) -> Option<String> {
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn core_work_status_is_active(status: &str) -> bool {
+    matches!(status, "pending" | "failed" | "processing")
 }
 
 fn core_work_status_item_from_row(row: &PgRow) -> CoreWorkStatusItem {
@@ -235,10 +281,86 @@ impl Database {
         idempotency_key: &str,
         payload: Value,
     ) -> Result<u64> {
+        match self
+            .try_enqueue_core_work_for_account(
+                account_id,
+                work_type,
+                idempotency_key,
+                payload,
+                CoreWorkBackpressureConfig::from_env(),
+            )
+            .await?
+        {
+            CoreWorkEnqueueOutcome::Enqueued(rows) => Ok(rows),
+            CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+                anyhow::bail!(
+                    "core work queue backpressure: active {} >= max {}",
+                    pressure.active,
+                    pressure.max_active
+                )
+            }
+        }
+    }
+
+    pub async fn try_enqueue_core_work_for_account(
+        &self,
+        account_id: &str,
+        work_type: CoreWorkType,
+        idempotency_key: &str,
+        payload: Value,
+        backpressure: CoreWorkBackpressureConfig,
+    ) -> Result<CoreWorkEnqueueOutcome> {
         let source = payload_text(&payload, "requested_by")
             .or_else(|| payload_text(&payload, "source"))
             .unwrap_or_else(|| "system".to_string());
         let reason = payload_text(&payload, "reason").unwrap_or_else(|| "unspecified".to_string());
+        let existing_status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM core_work_queue
+            WHERE account_id = $1
+              AND work_type = $2
+              AND idempotency_key = $3
+            "#,
+        )
+        .bind(account_id)
+        .bind(work_type.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load existing core work status for backpressure")?;
+        let pressure = self
+            .core_work_queue_pressure_for_account_with_limit(account_id, backpressure.max_active)
+            .await?;
+        let would_increase_active = existing_status
+            .as_deref()
+            .map(|status| !core_work_status_is_active(status))
+            .unwrap_or(true);
+        if would_increase_active && pressure.backpressured {
+            crate::metrics::counter(
+                "core_work_enqueue_backpressure_total",
+                1,
+                &[
+                    ("work_type", work_type.as_str()),
+                    ("source", source.as_str()),
+                ],
+            );
+            log::warn!(
+                target: "core_work",
+                "{}",
+                serde_json::json!({
+                    "event": "core_work_enqueue_backpressure",
+                    "account_id": account_id,
+                    "work_type": work_type.as_str(),
+                    "idempotency_key": idempotency_key,
+                    "source": source,
+                    "reason": reason,
+                    "active": pressure.active,
+                    "max_active": pressure.max_active,
+                })
+            );
+            return Ok(CoreWorkEnqueueOutcome::Backpressured(pressure));
+        }
 
         let result = sqlx::query(
             r#"
@@ -311,7 +433,7 @@ impl Database {
                 "rows_affected": result.rows_affected(),
             })
         );
-        Ok(result.rows_affected())
+        Ok(CoreWorkEnqueueOutcome::Enqueued(result.rows_affected()))
     }
 
     pub async fn claim_core_work_for_account(
@@ -965,6 +1087,37 @@ impl Database {
         })
     }
 
+    pub async fn core_work_queue_pressure_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<CoreWorkQueuePressure> {
+        self.core_work_queue_pressure_for_account_with_limit(
+            account_id,
+            CoreWorkBackpressureConfig::from_env().max_active,
+        )
+        .await
+    }
+
+    pub async fn core_work_queue_pressure_for_account_with_limit(
+        &self,
+        account_id: &str,
+        max_active: i64,
+    ) -> Result<CoreWorkQueuePressure> {
+        let active = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM core_work_queue
+            WHERE account_id = $1
+              AND status IN ('pending', 'failed', 'processing')
+            "#,
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("core_work_queue_pressure")?;
+        Ok(CoreWorkQueuePressure::new(active, max_active))
+    }
+
     pub async fn has_active_core_work_type_for_account(
         &self,
         account_id: &str,
@@ -1013,14 +1166,17 @@ impl Database {
         account_id: &str,
     ) -> Result<CoreWorkStatusSummary> {
         let queue_depth = self.core_work_queue_depth_for_account(account_id).await?;
+        let queue_pressure = self
+            .core_work_queue_pressure_for_account(account_id)
+            .await?;
         crate::metrics::gauge(
-            "core_work_queue_pending",
-            queue_depth.pending as f64,
+            "core_work_queue_active",
+            queue_pressure.active as f64,
             &[("account_id", account_id)],
         );
         crate::metrics::gauge(
-            "core_work_queue_processing",
-            queue_depth.processing as f64,
+            "core_work_queue_pressure",
+            queue_pressure.active as f64 / queue_pressure.max_active as f64,
             &[("account_id", account_id)],
         );
         let active_work = self
@@ -1081,6 +1237,7 @@ impl Database {
             account_id: account_id.to_string(),
             state,
             queue_depth,
+            queue_pressure,
             active_work,
             recent_failures,
             recent_completed,

@@ -824,9 +824,46 @@ async fn enqueue_core_work(
         return Ok(());
     }
 
-    db.enqueue_core_work_for_account(account_id, work_type, idempotency_key, payload)
+    let source = payload
+        .get("requested_by")
+        .and_then(|value| value.as_str())
+        .or_else(|| payload.get("source").and_then(|value| value.as_str()))
+        .unwrap_or("system")
+        .to_string();
+    let reason = payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unspecified")
+        .to_string();
+    match db
+        .try_enqueue_core_work_for_account(
+            account_id,
+            work_type,
+            idempotency_key,
+            payload,
+            db::CoreWorkBackpressureConfig::from_env(),
+        )
         .await
-        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?;
+        .with_context(|| format!("enqueue core work {}", work_type.as_str()))?
+    {
+        db::CoreWorkEnqueueOutcome::Enqueued(_) => {}
+        db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+            log::warn!(
+                target: "core_work",
+                "{}",
+                serde_json::json!({
+                    "event": "core_work_enqueue_deferred_backpressure",
+                    "account_id": account_id,
+                    "work_type": work_type.as_str(),
+                    "idempotency_key": idempotency_key,
+                    "source": source,
+                    "reason": reason,
+                    "active": pressure.active,
+                    "max_active": pressure.max_active,
+                })
+            );
+        }
+    }
     Ok(())
 }
 
