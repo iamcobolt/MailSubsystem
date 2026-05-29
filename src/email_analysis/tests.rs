@@ -261,6 +261,69 @@ fn infer_otp_status_does_not_guess_from_summary_keywords() {
     assert_eq!(infer_otp_status_from_result(&r), "not_otp");
 }
 
+fn utc_datetime(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .expect("valid RFC3339")
+        .with_timezone(&chrono::Utc)
+}
+
+#[test]
+fn otp_expiry_resolves_relative_text_against_email_date_header() {
+    let output = json!({ "otp_expires": "in 10 minutes" });
+    let raw = "Date: Mon, 25 May 2026 09:30:00 -0700\r\n\r\nBody";
+
+    let expiry = resolve_otp_expiry_from_output(&output, None, Some(raw));
+
+    assert_eq!(expiry, Some(utc_datetime("2026-05-25T16:40:00Z")));
+}
+
+#[test]
+fn otp_expiry_resolves_wall_clock_against_email_send_date() {
+    let output = json!({ "otp_expires": "10:15 AM" });
+    let raw = "Date: Mon, 25 May 2026 09:30:00 +0000\r\n\r\nBody";
+
+    let expiry = resolve_otp_expiry_from_output(&output, None, Some(raw));
+
+    assert_eq!(expiry, Some(utc_datetime("2026-05-25T10:15:00Z")));
+}
+
+#[test]
+fn otp_expiry_uses_date_header_timezone_for_ambiguous_wall_clock() {
+    let output = json!({ "otp_expires": "10:15 AM" });
+    let raw = "Date: Mon, 25 May 2026 09:30:00 -0700\r\n\r\nBody";
+
+    let expiry = resolve_otp_expiry_from_output(
+        &output,
+        Some(utc_datetime("2026-05-25T16:30:00Z")),
+        Some(raw),
+    );
+
+    assert_eq!(expiry, Some(utc_datetime("2026-05-25T17:15:00Z")));
+}
+
+#[test]
+fn otp_expiry_falls_back_to_received_date_when_date_header_missing() {
+    let output = json!({ "otp_expires": "5 minutes" });
+    let raw = "Subject: Your code\r\n\r\nBody";
+
+    let expiry = resolve_otp_expiry_from_output(
+        &output,
+        Some(utc_datetime("2026-05-25T09:30:00Z")),
+        Some(raw),
+    );
+
+    assert_eq!(expiry, Some(utc_datetime("2026-05-25T09:35:00Z")));
+}
+
+#[test]
+fn otp_expiry_relative_text_without_send_time_is_left_unresolved() {
+    let output = json!({ "otp_expires": "in 10 minutes" });
+
+    let expiry = resolve_otp_expiry_from_output(&output, None, None);
+
+    assert_eq!(expiry, None);
+}
+
 #[test]
 fn classification_reflection_triggers_on_consequential_or_uncertain_results() {
     let clear_safe = AnalysisResult {
@@ -556,6 +619,9 @@ fn test_harness_output_to_analysis_result_deserializes() {
     };
 
     let email = sample_email();
+    let expected_otp_expiry = email
+        .received_date
+        .map(|date| date + chrono::Duration::minutes(10));
     let analysis = harness_output_to_analysis_result(result, &email).expect("deserialize");
     assert_eq!(analysis.spam_status.as_deref(), Some("not-spam"));
     assert!(analysis
@@ -563,9 +629,51 @@ fn test_harness_output_to_analysis_result_deserializes() {
         .map(|value| (value - 0.95).abs() < 0.0001)
         .unwrap_or(false));
     assert_eq!(analysis.otp_code.as_deref(), Some("123456"));
+    assert_eq!(analysis.otp_expires, expected_otp_expiry);
     assert_eq!(analysis.threat_level.as_deref(), Some("none"));
     assert!(analysis.ai_summary.is_some());
     assert_eq!(analysis.analyzed_by.as_deref(), Some("harness:r1"));
+}
+
+#[test]
+fn test_harness_output_to_analysis_result_accepts_relative_otp_expiry_text() {
+    let output = json!({
+        "spam_status": "not-spam",
+        "phishing_status": "not-phishing",
+        "marketing_status": "not-marketing",
+        "otp_status": "otp",
+        "otp_code": "123456",
+        "category": "financial",
+        "email_type": "transactional",
+        "human_summary": "Test email",
+        "threat_level": "none",
+        "otp_expires": "in 10 minutes"
+    });
+    let result = RunResult {
+        run_id: "r-relative".to_string(),
+        output,
+        should_escalate: false,
+        escalate_reason: None,
+        llm_calls: 1,
+        tool_calls: 0,
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    let mut email = sample_email();
+    email.received_date = None;
+    email.raw_email_content =
+        Some("Date: Mon, 25 May 2026 09:30:00 -0700\r\n\r\nCode body".to_string());
+    let analysis = harness_output_to_analysis_result(result, &email).expect("deserialize");
+
+    assert_eq!(
+        analysis.otp_expires,
+        Some(utc_datetime("2026-05-25T16:40:00Z"))
+    );
+    assert_eq!(
+        analysis.ai_summary.as_ref().unwrap()["otp_expires"],
+        "in 10 minutes"
+    );
 }
 
 #[test]

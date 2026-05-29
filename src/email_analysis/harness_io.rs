@@ -6,6 +6,8 @@ use crate::attachments::AttachmentProcessor;
 use crate::db::EmailRecord;
 use crate::harness::RunResult;
 
+use super::result_normalization::prepare_analysis_output_for_deserialization;
+
 #[cfg(test)]
 pub(super) fn email_to_harness_input(email: &EmailRecord) -> Value {
     email_to_harness_input_with_worker_instruction(email, None)
@@ -138,26 +140,22 @@ pub(super) fn harness_output_to_analysis_result(
     result: RunResult,
     email: &EmailRecord,
 ) -> Result<AnalysisResult> {
+    let raw_output = result.output.clone();
+    let (analysis_output, otp_expires) = prepare_analysis_output_for_deserialization(
+        &raw_output,
+        email.received_date,
+        email.raw_email_content.as_deref(),
+    );
     let confidence = result
         .output
         .get("confidence")
         .and_then(|value| value.as_f64())
         .map(|value| value as f32);
-    let otp_expires = result
-        .output
-        .get("otp_expires_minutes")
-        .and_then(|value| value.as_i64())
-        .and_then(|minutes| {
-            email
-                .received_date
-                .as_ref()
-                .map(|received| *received + chrono::Duration::minutes(minutes.max(0)))
-        });
 
-    let mut analysis: AnalysisResult = serde_json::from_value(result.output.clone())
+    let mut analysis: AnalysisResult = serde_json::from_value(analysis_output)
         .context("deserialize harness output to AnalysisResult")?;
     if analysis.ai_summary.is_none() {
-        analysis.ai_summary = Some(result.output.clone());
+        analysis.ai_summary = Some(raw_output);
     }
     analysis.analyzed_by = Some(format!("harness:{}", result.run_id));
     analysis.token_usage = Some(TokenUsage {
@@ -175,29 +173,25 @@ pub(super) fn orchestrator_output_to_analysis_result(
     result: RunResult,
     email: &EmailRecord,
 ) -> Result<AnalysisResult> {
-    let output = result
+    let raw_output = result
         .output
         .get("result")
         .cloned()
         .context("orchestrator result missing")?;
-    let confidence = output
+    let (analysis_output, otp_expires) = prepare_analysis_output_for_deserialization(
+        &raw_output,
+        email.received_date,
+        email.raw_email_content.as_deref(),
+    );
+    let confidence = raw_output
         .get("confidence")
         .and_then(|value| value.as_f64())
         .map(|value| value as f32);
-    let otp_expires = output
-        .get("otp_expires_minutes")
-        .and_then(|value| value.as_i64())
-        .and_then(|minutes| {
-            email
-                .received_date
-                .as_ref()
-                .map(|received| *received + chrono::Duration::minutes(minutes.max(0)))
-        });
 
     let mut analysis: AnalysisResult =
-        serde_json::from_value(output.clone()).context("deserialize orchestrator output")?;
+        serde_json::from_value(analysis_output).context("deserialize orchestrator output")?;
     if analysis.ai_summary.is_none() {
-        analysis.ai_summary = Some(output);
+        analysis.ai_summary = Some(raw_output);
     }
     analysis.analyzed_by = Some(format!("orchestrator:{}", result.run_id));
     analysis.token_usage = Some(TokenUsage {
