@@ -21,6 +21,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::model_ref::ModelRef;
+
 /// Chat message for provider API.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -396,21 +398,49 @@ impl AIConfig {
     }
 
     fn load_from_env() -> Result<Self> {
-        let provider = match std::env::var("AI_PROVIDER") {
-            Ok(p) => p,
-            Err(_) => Self::detect_provider()?,
+        let analysis_model = env_non_empty("ANALYSIS_MODEL")
+            .map(|value| ModelRef::parse(&value, "ANALYSIS_MODEL"))
+            .transpose()?;
+        let explicit_provider = env_non_empty("AI_PROVIDER");
+        let mut provider = match (&explicit_provider, &analysis_model) {
+            (Some(p), _) => p.clone(),
+            (None, Some(model_ref)) => model_ref.provider().to_string(),
+            (None, None) => Self::detect_provider()?,
         };
         let local_llm_enabled = std::env::var("LOCAL_LLM_ENABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
-        let local_llm_url = std::env::var("LOCAL_LLM_URL").ok();
-        let local_llm_model = std::env::var("LOCAL_LLM_MODEL").ok();
-        let local_llm_api_key = std::env::var("LOCAL_LLM_API_KEY").ok();
-        let frontier_provider = std::env::var("FRONTIER_PROVIDER").ok();
-        let frontier_model = std::env::var("FRONTIER_MODEL").ok();
-        let gemini_api_key = std::env::var("GEMINI_API_KEY").ok();
-        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let local_llm_url = env_non_empty("LOCAL_LLM_URL");
+        let mut local_llm_model = env_non_empty("LOCAL_LLM_MODEL");
+        let mut frontier_provider = env_non_empty("FRONTIER_PROVIDER");
+        let mut frontier_model = env_non_empty("FRONTIER_MODEL");
+        if let Some(model_ref) = &analysis_model {
+            apply_analysis_model_config(
+                model_ref,
+                explicit_provider.as_deref(),
+                &mut provider,
+                &mut frontier_provider,
+                &mut frontier_model,
+                &mut local_llm_model,
+            )?;
+        }
+
+        let mut local_llm_api_key = env_non_empty("LOCAL_LLM_API_KEY");
+        let mut gemini_api_key = env_non_empty("GEMINI_API_KEY");
+        let mut openai_api_key = env_non_empty("OPENAI_API_KEY");
+        let mut anthropic_api_key = env_non_empty("ANTHROPIC_API_KEY");
+        apply_analysis_api_key(
+            env_non_empty("ANALYSIS_API_KEY"),
+            if provider.eq_ignore_ascii_case("hybrid") {
+                frontier_provider.as_deref().unwrap_or("gemini")
+            } else {
+                provider.as_str()
+            },
+            &mut local_llm_api_key,
+            &mut gemini_api_key,
+            &mut openai_api_key,
+            &mut anthropic_api_key,
+        );
         let analysis_mode =
             std::env::var("AI_ANALYSIS_MODE").unwrap_or_else(|_| "standard".to_string());
         let max_iterations = std::env::var("AI_MAX_ITERATIONS")
@@ -460,7 +490,6 @@ impl AIConfig {
             || provider == "local"
             || provider == "ollama"
             || provider == "omlx"
-            || provider == "codex"
         {
             return None;
         }
@@ -530,7 +559,10 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                 .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string());
             Ok(Box::new(AnthropicProvider::new(api_key, model)?))
         }
-        "codex" => Ok(Box::new(CodexCliProvider::from_env()?)),
+        "codex" => {
+            let model = required_frontier_model(config.frontier_model.as_deref(), "codex")?;
+            Ok(Box::new(CodexCliProvider::from_model(model)?))
+        }
         "hybrid" => {
             // For hybrid, create the frontier provider. If no API keys are set, fall back to local LLM as frontier (local-only).
             let frontier_name = config
@@ -573,7 +605,10 @@ pub fn create_provider(config: &AIConfig) -> Result<Box<dyn AIProvider>> {
                         None
                     }
                 }
-                "codex" => Some(Box::new(CodexCliProvider::from_env()?) as Box<dyn AIProvider>),
+                "codex" => {
+                    let model = required_frontier_model(config.frontier_model.as_deref(), "codex")?;
+                    Some(Box::new(CodexCliProvider::from_model(model)?) as Box<dyn AIProvider>)
+                }
                 _ => None,
             };
             if let Some(provider) = frontier {
@@ -1014,19 +1049,15 @@ impl AIProvider for LMStudioProvider {
 /// ChatGPT/Codex account.
 pub struct CodexCliProvider {
     bin: String,
-    model: Option<String>,
+    model: String,
     profile: Option<String>,
     sandbox: String,
     timeout: Duration,
 }
 
 impl CodexCliProvider {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_model(model: String) -> Result<Self> {
         let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-        let model = std::env::var("CODEX_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         let profile = std::env::var("CODEX_PROFILE")
             .ok()
             .map(|value| value.trim().to_string())
@@ -1156,9 +1187,7 @@ impl CodexCliProvider {
             .arg("--output-last-message")
             .arg(&output_path);
 
-        if let Some(model) = &self.model {
-            command.arg("--model").arg(model);
-        }
+        command.arg("--model").arg(&self.model);
         if let Some(profile) = &self.profile {
             command.arg("--profile").arg(profile);
         }
@@ -1226,6 +1255,101 @@ impl CodexCliProvider {
         }
 
         Ok(final_message)
+    }
+}
+
+fn required_frontier_model(value: Option<&str>, provider: &str) -> Result<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "A model is required when using the {provider} provider. Set ANALYSIS_MODEL={provider}/<model> in .env, or set legacy FRONTIER_MODEL for this deployment."
+            )
+        })
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn is_local_analysis_provider(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "lmstudio" | "local" | "ollama" | "omlx"
+    )
+}
+
+fn analysis_providers_compatible(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || (is_local_analysis_provider(left) && is_local_analysis_provider(right))
+}
+
+fn apply_analysis_model_config(
+    model_ref: &ModelRef,
+    explicit_provider: Option<&str>,
+    provider: &mut String,
+    frontier_provider: &mut Option<String>,
+    frontier_model: &mut Option<String>,
+    local_llm_model: &mut Option<String>,
+) -> Result<()> {
+    let model_provider = model_ref.provider();
+    if let Some(explicit_provider) = explicit_provider {
+        let explicit_provider = explicit_provider.trim();
+        if explicit_provider.eq_ignore_ascii_case("hybrid") {
+            if is_local_analysis_provider(model_provider) {
+                anyhow::bail!(
+                    "ANALYSIS_MODEL={}/{} uses a local provider, which conflicts with AI_PROVIDER=hybrid. Remove AI_PROVIDER or set ANALYSIS_MODEL to a frontier provider/model.",
+                    model_ref.provider(),
+                    model_ref.model()
+                );
+            }
+            *provider = "hybrid".to_string();
+            *frontier_provider = Some(model_provider.to_string());
+            *frontier_model = Some(model_ref.model().to_string());
+            return Ok(());
+        }
+        if !analysis_providers_compatible(explicit_provider, model_provider) {
+            anyhow::bail!(
+                "ANALYSIS_MODEL provider '{}' conflicts with AI_PROVIDER '{}'. Use ANALYSIS_MODEL as the source of truth or make AI_PROVIDER match.",
+                model_provider,
+                explicit_provider
+            );
+        }
+        *provider = explicit_provider.to_string();
+    } else {
+        *provider = model_provider.to_string();
+    }
+
+    if is_local_analysis_provider(model_provider) {
+        *local_llm_model = Some(model_ref.model().to_string());
+    } else {
+        *frontier_provider = Some(model_provider.to_string());
+        *frontier_model = Some(model_ref.model().to_string());
+    }
+    Ok(())
+}
+
+fn apply_analysis_api_key(
+    api_key: Option<String>,
+    provider: &str,
+    local_llm_api_key: &mut Option<String>,
+    gemini_api_key: &mut Option<String>,
+    openai_api_key: &mut Option<String>,
+    anthropic_api_key: &mut Option<String>,
+) {
+    let Some(api_key) = api_key else {
+        return;
+    };
+    match provider.to_ascii_lowercase().as_str() {
+        "gemini" => *gemini_api_key = Some(api_key),
+        "openai" => *openai_api_key = Some(api_key),
+        "anthropic" => *anthropic_api_key = Some(api_key),
+        provider if is_local_analysis_provider(provider) => *local_llm_api_key = Some(api_key),
+        _ => {}
     }
 }
 
@@ -1602,7 +1726,7 @@ mod tests {
     fn test_codex_prompt_includes_mail_subsystem_tool_protocol() {
         let provider = CodexCliProvider {
             bin: "codex".to_string(),
-            model: None,
+            model: "test-codex-model".to_string(),
             profile: None,
             sandbox: "read-only".to_string(),
             timeout: Duration::from_secs(30),
@@ -1637,9 +1761,43 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_provider_is_not_api_rate_limited() {
+    fn test_frontier_model_is_required_and_trimmed() {
+        assert_eq!(
+            required_frontier_model(Some("  configured-model  "), "codex").unwrap(),
+            "configured-model"
+        );
+        assert!(required_frontier_model(None, "codex").is_err());
+        assert!(required_frontier_model(Some("   "), "codex").is_err());
+    }
+
+    #[test]
+    fn test_analysis_model_config_sets_provider_and_model() {
+        let model_ref = ModelRef::parse("codex/test-model", "ANALYSIS_MODEL").unwrap();
+        let mut provider = String::new();
+        let mut frontier_provider = None;
+        let mut frontier_model = None;
+        let mut local_model = None;
+
+        apply_analysis_model_config(
+            &model_ref,
+            None,
+            &mut provider,
+            &mut frontier_provider,
+            &mut frontier_model,
+            &mut local_model,
+        )
+        .unwrap();
+
+        assert_eq!(provider, "codex");
+        assert_eq!(frontier_provider.as_deref(), Some("codex"));
+        assert_eq!(frontier_model.as_deref(), Some("test-model"));
+        assert!(local_model.is_none());
+    }
+
+    #[test]
+    fn test_codex_provider_uses_frontier_pressure_limit() {
         let cfg = AIConfig::default();
 
-        assert_eq!(cfg.rate_limit_for_provider("codex"), None);
+        assert_eq!(cfg.rate_limit_for_provider("codex"), Some(60));
     }
 }

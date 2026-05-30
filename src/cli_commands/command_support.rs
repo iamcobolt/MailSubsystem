@@ -17,14 +17,19 @@ pub async fn create_rag_builder(
 ) -> anyhow::Result<Arc<rag::RAGContextBuilder>> {
     let embedder = embeddings::create_embedding_provider().await?;
     embeddings::validate_embedding_model(&database, embedder.as_ref()).await?;
+    let embedding_provider_name = embedder.provider_name().to_string();
     let rpm = ai_config.and_then(|cfg| {
         if embedder.is_local() {
             None
         } else {
-            cfg.rate_limit_for_provider("gemini")
+            cfg.rate_limit_for_provider(&embedding_provider_name)
         }
     });
-    let wrapped = rate_limit::wrap_embedding_provider(Arc::from(embedder), rpm);
+    let wrapped = rate_limit::wrap_embedding_provider_with_pressure(
+        Arc::from(embedder),
+        &embedding_provider_name,
+        rpm,
+    );
     Ok(Arc::new(rag::RAGContextBuilder::with_embedder(
         database, wrapped,
     )))

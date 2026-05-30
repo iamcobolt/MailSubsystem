@@ -111,8 +111,10 @@ nano ../MailSubsystem/.env    # or vim, code, etc.
 ```
 
 ```env
-AI_PROVIDER=gemini
-GEMINI_API_KEY=your-key-here
+ANALYSIS_MODEL=gemini/gemini-2.0-flash
+ANALYSIS_API_KEY=your-key-here
+EMBEDDING_MODEL=gemini/gemini-embedding-001
+EMBEDDING_API_KEY=your-key-here
 ```
 
 ### Step 5: Run the app
@@ -261,8 +263,10 @@ MailSubsystem uses an LLM to classify and summarize your emails. You need at lea
 3. Copy the key
 
 ```env
-AI_PROVIDER=gemini
-GEMINI_API_KEY=your-key-here
+ANALYSIS_MODEL=gemini/gemini-2.0-flash
+ANALYSIS_API_KEY=your-key-here
+EMBEDDING_MODEL=gemini/gemini-embedding-001
+EMBEDDING_API_KEY=your-key-here
 ```
 
 Check Google's current pricing and rate limits before running large batches.
@@ -274,8 +278,8 @@ Check Google's current pricing and rate limits before running large batches.
 3. Review current pricing and billing requirements
 
 ```env
-AI_PROVIDER=openai
-OPENAI_API_KEY=sk-your-key-here
+ANALYSIS_MODEL=openai/gpt-4o
+ANALYSIS_API_KEY=sk-your-key-here
 ```
 
 ### Alternative: Codex subscription
@@ -294,8 +298,8 @@ the CLI is not logged in, it will stop with instructions to run `codex login` or
 Then configure MailSubsystem to use the Codex CLI provider:
 
 ```env
-AI_PROVIDER=codex
-CODEX_BIN=codex
+ANALYSIS_MODEL=codex/your-codex-model
+# CODEX_BIN=codex        # optional; PATH is used by default
 CODEX_SANDBOX=read-only
 CODEX_TIMEOUT_SECS=300
 ```
@@ -307,12 +311,14 @@ as the frontier provider:
 AI_PROVIDER=hybrid
 LOCAL_LLM_URL=http://localhost:1234/v1
 LOCAL_LLM_MODEL=your-model-name
-FRONTIER_PROVIDER=codex
+ANALYSIS_MODEL=codex/your-codex-model
 ```
 
 This adapter runs `codex exec` as a subprocess using your signed-in Codex client.
 It does not require `OPENAI_API_KEY`, but it is slower than direct API calls and
 counts against your Codex plan limits or Codex credits.
+`ANALYSIS_MODEL` is passed to `codex exec --model`; `CODEX_BIN` is optional
+because the daemon searches `PATH` for `codex` by default.
 
 ### Alternative: Anthropic (Claude)
 
@@ -321,8 +327,8 @@ counts against your Codex plan limits or Codex credits.
 3. Add billing ($5 minimum credit)
 
 ```env
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-your-key-here
+ANALYSIS_MODEL=anthropic/claude-3-5-sonnet-20241022
+ANALYSIS_API_KEY=sk-ant-your-key-here
 ```
 
 ### Alternative: Local LLM (free, no API key)
@@ -330,9 +336,8 @@ ANTHROPIC_API_KEY=sk-ant-your-key-here
 If you have [LM Studio](https://lmstudio.ai/) or [Ollama](https://ollama.ai/) running locally:
 
 ```env
-AI_PROVIDER=lmstudio
+ANALYSIS_MODEL=lmstudio/your-model-name
 LOCAL_LLM_URL=http://localhost:1234/v1
-LOCAL_LLM_MODEL=your-model-name
 LOCAL_LLM_CONCURRENCY=2
 ```
 
@@ -343,9 +348,9 @@ increase `LOCAL_LLM_CONCURRENCY`, or set `ANALYZE_CONCURRENCY` /
 parallel requests.
 
 If you use a local model for analysis but want frontier embeddings for RAG,
-set `EMBEDDING_PROVIDER=gemini` and keep `GEMINI_API_KEY` or
-`EMBEDDING_API_KEY` configured. For local embeddings, set `EMBEDDING_MODEL` to
-an embedding model that is actually installed on your local model server.
+set `EMBEDDING_MODEL=gemini/gemini-embedding-001` and configure
+`EMBEDDING_API_KEY`. For local embeddings, set `EMBEDDING_MODEL` to a
+provider/model ref for an embedding model installed on your local model server.
 
 ### Cost awareness
 
@@ -609,14 +614,13 @@ Timers, agents, and manual commands enqueue work into core rather than acting li
 
 - Verify your API key: `make test-llm-frontier`
 - Check the key is uncommented in `.env` (no leading `#`)
-- If you hit provider rate limits, wait and retry or reduce batch size: `ANALYZE_LIMIT=5`
+- If you hit provider pressure, wait and retry; the daemon backs off automatically.
 
 ### "429 Too Many Requests" or "RESOURCE_EXHAUSTED"
 
 You've hit your API provider's rate limit. Options:
-- Wait and retry (the daemon handles this automatically with backoff)
-- Lower the rate limit: `API_RATE_LIMIT_RPM=15` in `.env`
-- Use a smaller batch: `ANALYZE_LIMIT=5`
+- Wait and retry; the adaptive provider-pressure controller backs off and recovers.
+- Use `API_RATE_LIMIT_RPM` only as a conservative initial guardrail.
 - Switch to a local LLM for bulk processing
 
 ### Analysis is slow

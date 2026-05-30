@@ -152,7 +152,7 @@ fn classify_db_prerequisite_work(snapshot: &DbCompletenessSnapshot) -> Vec<CoreW
         work.push(CoreWorkType::SyncBody);
     }
 
-    if snapshot.analysis_missing > 0 {
+    if snapshot.analysis_ready > 0 {
         work.push(CoreWorkType::Analyze);
     }
 
@@ -796,8 +796,8 @@ fn db_prerequisites_pending_markdown(
     }
     if snapshot.analysis_missing > 0 {
         details.push(format!(
-            "- Analysis: {} emails still need classification and safety analysis.",
-            snapshot.analysis_missing
+            "- Analysis: {} emails still need classification and safety analysis; {} are eligible now.",
+            snapshot.analysis_missing, snapshot.analysis_ready
         ));
     }
     if snapshot.embedding_missing > 0 {
@@ -2787,6 +2787,7 @@ mod tests {
             missing_message_id: 0,
             body_missing: 0,
             analysis_missing: 0,
+            analysis_ready: 0,
             embedding_missing: 0,
             location_missing: 0,
             filing_pending: 0,
@@ -2877,6 +2878,7 @@ mod tests {
     fn test_classify_db_prerequisite_work_for_missing_analysis() {
         let snapshot = DbCompletenessSnapshot {
             analysis_missing: 2,
+            analysis_ready: 2,
             ..ready_db_snapshot()
         };
 

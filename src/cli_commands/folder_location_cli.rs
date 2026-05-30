@@ -344,11 +344,11 @@ pub async fn run_locate_with_limit_for_account(
     let provider: Arc<dyn ai::AIProvider> = Arc::from(provider_box);
     let provider_is_local = provider.is_local();
     let locate_concurrency = locate_concurrency_from_env(&ai_config, provider_is_local);
-    let provider = if provider_is_local {
-        provider
-    } else {
-        rate_limit::wrap_ai_provider(provider, ai_config.rate_limit_for_provider(&provider_name))
-    };
+    let provider = rate_limit::wrap_ai_provider_with_pressure(
+        provider,
+        &provider_name,
+        ai_config.rate_limit_for_provider(&provider_name),
+    );
 
     let rag = super::shared::create_rag_builder(db.clone(), Some(&ai_config)).await?;
     let agents_dir = load_agent_specs_dir();

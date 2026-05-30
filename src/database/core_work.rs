@@ -172,16 +172,16 @@ fn core_work_claim_lease_secs_from_env() -> i64 {
         .max(1)
 }
 
-fn core_work_status_is_active(status: &str) -> bool {
-    matches!(status, "pending" | "failed" | "processing")
-}
-
 fn payload_text(payload: &Value, key: &str) -> Option<String> {
     payload
         .get(key)
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn core_work_status_is_active(status: &str) -> bool {
+    matches!(status, "pending" | "failed" | "processing")
 }
 
 fn core_work_status_item_from_row(row: &PgRow) -> CoreWorkStatusItem {
@@ -469,7 +469,6 @@ impl Database {
                         WHEN 'subagent_task' THEN 1
                         ELSE 0
                     END ASC,
-                    available_at ASC,
                     CASE work_type
                         WHEN 'sync_full' THEN 0
                         WHEN 'sync_body' THEN 1
@@ -483,6 +482,7 @@ impl Database {
                         WHEN 'subagent_task' THEN 9
                         ELSE 10
                     END ASC,
+                    available_at ASC,
                     id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED

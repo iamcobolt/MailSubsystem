@@ -36,6 +36,7 @@ mod imap;
 mod location_analysis;
 #[path = "metrics_sink.rs"]
 mod metrics;
+mod model_ref;
 #[path = "run_observability.rs"]
 mod observability;
 #[path = "mailbox_retrieval.rs"]
