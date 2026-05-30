@@ -455,6 +455,95 @@ async fn test_get_unanalyzed_emails_force_includes_analyzed_rows() {
 
 #[tokio::test]
 #[ignore]
+async fn test_claimed_failed_attempt_can_mark_permanent_before_releasing_claim() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping claimed permanent failure test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let prefix = format!("claimed-permanent-failure-{}-", Uuid::new_v4());
+    cleanup_test_emails(&db, &prefix).await;
+
+    let message_id = format!("{}email", prefix);
+    let worker_id = format!("{}worker", prefix);
+
+    sqlx::query(
+        r#"
+            INSERT INTO emails (
+                account_id,
+                message_id,
+                received_date,
+                body_text,
+                analysis_attempts,
+                analysis_permanent_failure,
+                analysis_locked_at,
+                analysis_worker_id,
+                analysis_lock_expires_at,
+                deleted_from_server_at
+            )
+            VALUES ($1, $2, NOW(), 'body', 4, FALSE, NOW(), $3, NOW() + INTERVAL '1 hour', NULL)
+            "#,
+    )
+    .bind(DEFAULT_ACCOUNT_ID)
+    .bind(&message_id)
+    .bind(&worker_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert claimed email row");
+
+    let rows = db
+        .record_analysis_attempt_failed_for_claimed_account(
+            DEFAULT_ACCOUNT_ID,
+            &message_id,
+            &worker_id,
+            "analysis failed",
+            true,
+        )
+        .await
+        .expect("record claimed failed attempt");
+
+    assert_eq!(rows, 1);
+
+    let row = sqlx::query(
+        r#"
+            SELECT
+                analysis_attempts,
+                analysis_permanent_failure,
+                last_analysis_error,
+                analysis_locked_at,
+                analysis_worker_id,
+                analysis_lock_expires_at
+            FROM emails
+            WHERE account_id = $1
+              AND message_id = $2
+            "#,
+    )
+    .bind(DEFAULT_ACCOUNT_ID)
+    .bind(&message_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch claimed email row");
+
+    assert_eq!(row.get::<i32, _>("analysis_attempts"), 5);
+    assert!(row.get::<bool, _>("analysis_permanent_failure"));
+    assert_eq!(
+        row.get::<Option<String>, _>("last_analysis_error")
+            .as_deref(),
+        Some("analysis failed")
+    );
+    assert!(row
+        .get::<Option<DateTime<Utc>>, _>("analysis_locked_at")
+        .is_none());
+    assert!(row.get::<Option<String>, _>("analysis_worker_id").is_none());
+    assert!(row
+        .get::<Option<DateTime<Utc>>, _>("analysis_lock_expires_at")
+        .is_none());
+
+    cleanup_test_emails(&db, &prefix).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_get_emails_needing_location_force_includes_existing_recommendations() {
     let Some(db) = load_test_database().await else {
         eprintln!("Skipping locate force test (no TEST_DATABASE_URL or DATABASE_URL)");

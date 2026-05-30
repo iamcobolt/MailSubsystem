@@ -26,6 +26,10 @@ pub enum Command {
         message_id: Option<String>,
         force: bool,
     },
+    AnalyzeWorker {
+        limit: usize,
+        concurrency: Option<usize>,
+    },
     ClassificationEval {
         corpus: Option<String>,
     },
@@ -131,6 +135,7 @@ impl Command {
             Command::CoreStatus => "core-status",
             Command::Tui { .. } => "tui",
             Command::Analyze { .. } => "analyze",
+            Command::AnalyzeWorker { .. } => "analyze-worker",
             Command::ClassificationEval { .. } => "classification-eval",
             Command::TestLlm { local, frontier } => {
                 if *local {
@@ -232,6 +237,10 @@ pub fn parse_command(args: &[String]) -> Command {
             };
             Command::Analyze { message_id, force }
         }
+        Some("analyze-worker") => Command::AnalyzeWorker {
+            limit: arg_value::<usize>(args, "--limit").unwrap_or(50),
+            concurrency: arg_value::<usize>(args, "--concurrency"),
+        },
         Some("classification-eval") => Command::ClassificationEval {
             corpus: arg_value::<String>(args, "--corpus"),
         },
@@ -367,6 +376,7 @@ pub fn print_usage() {
     );
     println!("  mailsubsystem status  - show imap_folders and emails table state");
     println!("  mailsubsystem analyze [--force] [message_id] - AI analysis (batch or one record)");
+    println!("  mailsubsystem analyze-worker [--limit N] [--concurrency M] - claim and analyze one safe parallel worker batch");
     println!("  mailsubsystem classification-eval [--corpus path] - run fixed classification regression eval corpus");
     println!(
         "  mailsubsystem test-llm --local   - test connection to local LLM (LM Studio / Ollama)"
@@ -481,6 +491,25 @@ mod tests {
             parse_command(&args),
             Command::ClassificationEval {
                 corpus: Some("fixtures/classification.json".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_analyze_worker_command_with_limit_and_concurrency() {
+        let args = vec![
+            "mailsubsystem".to_string(),
+            "analyze-worker".to_string(),
+            "--limit".to_string(),
+            "200".to_string(),
+            "--concurrency".to_string(),
+            "8".to_string(),
+        ];
+        assert_eq!(
+            parse_command(&args),
+            Command::AnalyzeWorker {
+                limit: 200,
+                concurrency: Some(8)
             }
         );
     }

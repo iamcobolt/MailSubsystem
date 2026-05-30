@@ -1150,6 +1150,7 @@ impl Database {
         message_id: &str,
         worker_id: &str,
         error: &str,
+        mark_permanent: bool,
     ) -> Result<u64> {
         let result = sqlx::query(
             r#"
@@ -1157,6 +1158,7 @@ impl Database {
             SET analysis_attempts = analysis_attempts + 1,
                 analysis_failed_at = NOW(),
                 last_analysis_error = LEFT($3, 2000),
+                analysis_permanent_failure = CASE WHEN $5 THEN TRUE ELSE analysis_permanent_failure END,
                 analysis_locked_at = NULL,
                 analysis_worker_id = NULL,
                 analysis_lock_expires_at = NULL,
@@ -1171,6 +1173,7 @@ impl Database {
         .bind(message_id)
         .bind(error)
         .bind(worker_id)
+        .bind(mark_permanent)
         .execute(&self.pool)
         .await
         .context("record_analysis_attempt_failed_for_claimed_account")?;
