@@ -764,6 +764,7 @@ pub async fn apply_analysis_result_for_account(
     apply_analysis_result_for_account_with_claim(db, account_id, message_id, None, r).await
 }
 
+#[allow(dead_code)]
 pub async fn apply_analysis_result_for_claimed_account(
     db: &Database,
     account_id: &str,
