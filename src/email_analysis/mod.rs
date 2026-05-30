@@ -21,7 +21,9 @@ mod result_normalization;
 mod tests;
 
 pub(crate) use classification_eval::run_classification_eval;
-pub use result_normalization::apply_analysis_result_for_account;
+pub use result_normalization::{
+    apply_analysis_result_for_account, apply_analysis_result_for_claimed_account,
+};
 
 use harness_io::{
     email_to_harness_input_with_worker_instruction, harness_output_to_analysis_result,
