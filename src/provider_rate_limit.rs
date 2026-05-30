@@ -13,6 +13,11 @@ use crate::embeddings::EmbeddingProvider;
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const DEFAULT_SLOW_LATENCY: Duration = Duration::from_secs(45);
 const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+/// Absolute ceiling for an explicit, server-provided `Retry-After`. We honor a
+/// server-requested delay even when it exceeds our local max backoff (retrying
+/// earlier than asked just earns another rejection), but still guard against a
+/// pathological value pinning the provider idle indefinitely.
+const RETRY_AFTER_CEILING: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 struct ProviderPressureState {
@@ -129,9 +134,13 @@ impl ProviderPressureLimiter {
             2.0,
         );
         let minimum_delay = self.base_interval.max(MIN_ERROR_BACKOFF);
-        state.current_interval = requested_delay
-            .unwrap_or(grown)
-            .clamp(minimum_delay, self.max_interval.max(minimum_delay));
+        state.current_interval = match requested_delay {
+            // Honor an explicit server `Retry-After` even if it exceeds our
+            // local max backoff; capping it below the requested delay would
+            // just trigger another rejection on the next request.
+            Some(delay) => delay.clamp(minimum_delay, RETRY_AFTER_CEILING),
+            None => grown.clamp(minimum_delay, self.max_interval.max(minimum_delay)),
+        };
         state.next_allowed = Instant::now() + state.current_interval;
         state.success_streak = 0;
         crate::metrics::counter(
@@ -359,6 +368,12 @@ pub fn wrap_ai_provider_with_pressure(
     provider_name: &str,
     requests_per_minute: Option<u32>,
 ) -> Arc<dyn AIProvider> {
+    // Local providers are not quota-limited and their slowness is expected;
+    // pressure backoff (including timeout-triggered backoff) would only throttle
+    // local throughput when the model is merely slow, so leave them unwrapped.
+    if provider.is_local() {
+        return provider;
+    }
     Arc::new(PressureLimitedAIProvider::new(
         provider,
         provider_name,
@@ -371,6 +386,11 @@ pub fn wrap_embedding_provider_with_pressure(
     provider_name: &str,
     requests_per_minute: Option<u32>,
 ) -> Arc<dyn EmbeddingProvider> {
+    // Local embedding servers are not quota-limited; see the AI-provider wrapper
+    // above for why local providers skip pressure backoff.
+    if provider.is_local() {
+        return provider;
+    }
     Arc::new(PressureLimitedEmbeddingProvider::new(
         provider,
         provider_name,
@@ -506,5 +526,73 @@ mod tests {
         let started = Instant::now();
         limiter.acquire().await;
         assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn provider_pressure_limiter_honors_retry_after_above_max_interval() {
+        let limiter = ProviderPressureLimiter::with_settings(
+            "test",
+            Duration::ZERO,
+            Duration::from_secs(10), // local max backoff is only 10s
+            Duration::from_secs(45),
+        );
+
+        limiter
+            .record_failure(&anyhow::anyhow!("429 Too Many Requests; retry-after: 120"))
+            .await;
+
+        // The server asked for 120s; we must wait the full requested delay
+        // rather than clamping down to the 10s local max backoff.
+        let interval = limiter.state.lock().await.current_interval;
+        assert_eq!(interval, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn provider_pressure_backoff_without_retry_after_stays_capped_at_max_interval() {
+        let limiter = ProviderPressureLimiter::with_settings(
+            "test",
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(45),
+        );
+
+        // Repeated pressure errors with no explicit Retry-After must not grow
+        // past the local max interval.
+        for _ in 0..10 {
+            limiter
+                .record_failure(&anyhow::anyhow!("503 service unavailable"))
+                .await;
+        }
+
+        let interval = limiter.state.lock().await.current_interval;
+        assert_eq!(interval, Duration::from_secs(5));
+    }
+
+    struct StubAiProvider {
+        local: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AIProvider for StubAiProvider {
+        async fn complete(&self, _messages: Vec<Message>) -> Result<AIResponse> {
+            anyhow::bail!("stub provider should not be invoked in this test")
+        }
+
+        fn is_local(&self) -> bool {
+            self.local
+        }
+    }
+
+    #[test]
+    fn wrap_ai_provider_skips_local_providers() {
+        let local: Arc<dyn AIProvider> = Arc::new(StubAiProvider { local: true });
+        let wrapped = wrap_ai_provider_with_pressure(local.clone(), "local", None);
+        // Local providers are returned unwrapped (same allocation), so no
+        // timeout/slow-latency backoff is ever applied to them.
+        assert!(Arc::ptr_eq(&local, &wrapped));
+
+        let frontier: Arc<dyn AIProvider> = Arc::new(StubAiProvider { local: false });
+        let wrapped = wrap_ai_provider_with_pressure(frontier.clone(), "gemini", Some(60));
+        assert!(!Arc::ptr_eq(&frontier, &wrapped));
     }
 }

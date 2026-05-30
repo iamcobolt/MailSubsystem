@@ -1316,6 +1316,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queue_pressure_marks_active_count_at_or_above_limit_as_backpressured() {
+        let under = CoreWorkQueuePressure::new(9, 10);
+        assert_eq!(under.active, 9);
+        assert_eq!(under.max_active, 10);
+        assert!(!under.backpressured);
+
+        let at_limit = CoreWorkQueuePressure::new(10, 10);
+        assert_eq!(at_limit.active, 10);
+        assert!(at_limit.backpressured);
+
+        let invalid_limit = CoreWorkQueuePressure::new(1, 0);
+        assert_eq!(invalid_limit.max_active, 1);
+        assert!(invalid_limit.backpressured);
+    }
+
     fn core_status_item_for_test(work_type: &str) -> CoreWorkStatusItem {
         let now = Utc::now();
         CoreWorkStatusItem {

@@ -542,6 +542,8 @@ async fn enqueue_conflict_review_if_needed(
     {
         db::CoreWorkEnqueueOutcome::Enqueued(_) => {}
         db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+            // Leave the review task pending; the core coordinator reschedules
+            // pending subagent tasks once queue pressure clears.
             log::warn!(
                 target: "core_work",
                 "{}",

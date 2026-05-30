@@ -19,6 +19,7 @@ use crate::sync_runtime;
 
 const DEFAULT_CORE_LOCATE_LIMIT: usize = 50;
 const DEFAULT_CORE_ANALYZE_PAGE_SIZE: usize = 50;
+const SUBAGENT_RESCHEDULE_LIMIT: i64 = 25;
 
 #[derive(Debug, Clone)]
 pub struct CoreCoordinatorConfig {
@@ -435,6 +436,14 @@ async fn run_once(db: &Arc<db::Database>, config: &CoreCoordinatorConfig) -> any
         .context("reset stale core work")?;
     if reset > 0 {
         log::info!("[core] reset {} stale work item(s)", reset);
+    }
+
+    let rescheduled = reschedule_pending_subagent_work(db, &config.account_id).await?;
+    if rescheduled > 0 {
+        log::info!(
+            "[core] rescheduled {} pending subagent task(s) without active core work",
+            rescheduled
+        );
     }
 
     let Some(work) = db
@@ -865,6 +874,66 @@ async fn enqueue_core_work(
         }
     }
     Ok(())
+}
+
+async fn reschedule_pending_subagent_work(
+    db: &Arc<db::Database>,
+    account_id: &str,
+) -> anyhow::Result<u64> {
+    let tasks = db
+        .list_pending_subagent_tasks_without_active_core_work_for_account(
+            account_id,
+            SUBAGENT_RESCHEDULE_LIMIT,
+        )
+        .await
+        .context("load pending subagent tasks for core work reschedule")?;
+    let mut enqueued = 0;
+
+    for task in tasks {
+        let reason = pending_subagent_reschedule_reason(&task);
+        let payload = subagent_runtime::subagent_payload_from_record(&task, reason);
+        match db
+            .try_enqueue_core_work_for_account(
+                account_id,
+                CoreWorkType::SubagentTask,
+                &task.task_id,
+                payload,
+                db::CoreWorkBackpressureConfig::from_env(),
+            )
+            .await
+            .with_context(|| format!("reschedule pending subagent task {}", task.task_id))?
+        {
+            db::CoreWorkEnqueueOutcome::Enqueued(_) => {
+                enqueued += 1;
+            }
+            db::CoreWorkEnqueueOutcome::Backpressured(pressure) => {
+                log::warn!(
+                    target: "core_work",
+                    "{}",
+                    serde_json::json!({
+                        "event": "subagent_task_reschedule_deferred_backpressure",
+                        "account_id": account_id,
+                        "work_type": CoreWorkType::SubagentTask.as_str(),
+                        "idempotency_key": task.task_id,
+                        "source": "mail-assistant",
+                        "reason": reason,
+                        "active": pressure.active,
+                        "max_active": pressure.max_active,
+                    })
+                );
+                break;
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
+fn pending_subagent_reschedule_reason(task: &SubagentTaskRecord) -> &'static str {
+    match task.skill_bundle.as_str() {
+        "conflict_review" | "safety_policy" => "pending_conflict_review_reschedule",
+        _ => "pending_subagent_reschedule",
+    }
 }
 
 fn should_coalesce_core_work(work_type: CoreWorkType) -> bool {
@@ -1377,5 +1446,25 @@ mod tests {
         assert!(should_coalesce_core_work(CoreWorkType::FileApply));
         assert!(!should_coalesce_core_work(CoreWorkType::AssistantHeartbeat));
         assert!(!should_coalesce_core_work(CoreWorkType::SubagentTask));
+    }
+
+    #[test]
+    fn pending_conflict_review_reschedules_with_specific_reason() {
+        let task = SubagentTaskRecord {
+            task_id: "review-task".to_string(),
+            task_kind: "conflict_review".to_string(),
+            worker_name: "conflict-review-worker".to_string(),
+            skill_bundle: "conflict_review".to_string(),
+            message_ids: Vec::new(),
+            input_context: Value::Null,
+            priority: 0,
+            correlation_id: "review-task".to_string(),
+            created_by: "mail-assistant".to_string(),
+        };
+
+        assert_eq!(
+            pending_subagent_reschedule_reason(&task),
+            "pending_conflict_review_reschedule"
+        );
     }
 }

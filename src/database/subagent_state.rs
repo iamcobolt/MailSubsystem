@@ -61,6 +61,53 @@ pub struct AssistantInsightInsert<'a> {
 }
 
 impl Database {
+    pub async fn list_pending_subagent_tasks_without_active_core_work_for_account(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SubagentTaskRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                task_id, task_kind, worker_name, skill_bundle, message_ids,
+                input_context, priority, correlation_id, created_by
+            FROM subagent_tasks task
+            WHERE task.account_id = $1
+              AND task.status = 'pending'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM core_work_queue work
+                  WHERE work.account_id = task.account_id
+                    AND work.work_type = 'subagent_task'
+                    AND work.idempotency_key = task.task_id
+                    AND work.status IN ('pending', 'failed', 'processing')
+              )
+            ORDER BY task.priority DESC, task.created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(account_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .context("list_pending_subagent_tasks_without_active_core_work")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| SubagentTaskRecord {
+                task_id: row.get("task_id"),
+                task_kind: row.get("task_kind"),
+                worker_name: row.get("worker_name"),
+                skill_bundle: row.get("skill_bundle"),
+                message_ids: row.get("message_ids"),
+                input_context: row.get::<Json<Value>, _>("input_context").0,
+                priority: row.get("priority"),
+                correlation_id: row.get("correlation_id"),
+                created_by: row.get("created_by"),
+            })
+            .collect())
+    }
+
     pub async fn upsert_subagent_task_for_account(
         &self,
         account_id: &str,

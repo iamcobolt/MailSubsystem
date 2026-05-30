@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::DEFAULT_ACCOUNT_ID;
+use crate::database::core_work::CoreWorkQueuePressure;
 use crate::database::schema_management::EMBEDDED_SCHEMA;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -1477,6 +1478,76 @@ async fn test_release_core_work_for_worker_only_releases_owned_processing_rows()
 
 #[tokio::test]
 #[ignore]
+async fn test_pending_subagent_tasks_without_active_core_work_are_listed_for_reschedule() {
+    let Some(db) = load_test_database().await else {
+        eprintln!(
+            "Skipping pending subagent reschedule test (no TEST_DATABASE_URL or DATABASE_URL)"
+        );
+        return;
+    };
+
+    let account_id = format!("subagent-reschedule-{}", Uuid::new_v4());
+    cleanup_test_core_work_account(&db, &account_id).await;
+
+    let stranded = SubagentTaskRecord {
+        task_id: "stranded-review".to_string(),
+        task_kind: "conflict_review".to_string(),
+        worker_name: "conflict-review-worker".to_string(),
+        skill_bundle: "conflict_review".to_string(),
+        message_ids: Vec::new(),
+        input_context: Value::Null,
+        priority: 10,
+        correlation_id: account_id.clone(),
+        created_by: "mail-assistant".to_string(),
+    };
+    let active = SubagentTaskRecord {
+        task_id: "active-review".to_string(),
+        priority: 5,
+        ..stranded.clone()
+    };
+    let completed = SubagentTaskRecord {
+        task_id: "completed-review".to_string(),
+        priority: 20,
+        ..stranded.clone()
+    };
+
+    db.upsert_subagent_task_for_account(&account_id, &stranded, None, "pending")
+        .await
+        .expect("insert stranded task");
+    db.upsert_subagent_task_for_account(&account_id, &active, None, "pending")
+        .await
+        .expect("insert active task");
+    db.upsert_subagent_task_for_account(&account_id, &completed, None, "completed")
+        .await
+        .expect("insert completed task");
+    db.enqueue_core_work_for_account(
+        &account_id,
+        CoreWorkType::SubagentTask,
+        &active.task_id,
+        serde_json::json!({
+            "task_id": active.task_id,
+            "task_kind": active.task_kind,
+            "skill_bundle": active.skill_bundle,
+            "created_by": active.created_by,
+            "reason": "already_enqueued"
+        }),
+    )
+    .await
+    .expect("enqueue active task work");
+
+    let pending = db
+        .list_pending_subagent_tasks_without_active_core_work_for_account(&account_id, 10)
+        .await
+        .expect("list pending subagent tasks without active work");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].task_id, stranded.task_id);
+
+    cleanup_test_core_work_account(&db, &account_id).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_core_work_claim_prioritizes_pipeline_over_subagent_support() {
     let Some(db) = load_test_database().await else {
         eprintln!("Skipping core work priority test (no TEST_DATABASE_URL or DATABASE_URL)");
@@ -1644,6 +1715,64 @@ async fn test_core_work_completion_requires_current_claim_lease() {
         row.get::<Option<DateTime<Utc>>, _>("lease_expires_at"),
         None
     );
+
+    cleanup_test_core_work_account(&db, &account_id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_core_work_enqueue_backpressure_rejects_new_active_rows() {
+    let Some(db) = load_test_database().await else {
+        eprintln!("Skipping core work backpressure test (no TEST_DATABASE_URL or DATABASE_URL)");
+        return;
+    };
+
+    let account_id = format!("core-backpressure-{}", Uuid::new_v4());
+    cleanup_test_core_work_account(&db, &account_id).await;
+    let backpressure = CoreWorkBackpressureConfig { max_active: 1 };
+
+    let first = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Analyze,
+            "first",
+            serde_json::json!({"reason": "backpressure_test"}),
+            backpressure,
+        )
+        .await
+        .expect("enqueue first work");
+    assert!(matches!(first, CoreWorkEnqueueOutcome::Enqueued(_)));
+
+    let second = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Embed,
+            "second",
+            serde_json::json!({"reason": "backpressure_test"}),
+            backpressure,
+        )
+        .await
+        .expect("backpressure second work");
+    assert!(matches!(
+        second,
+        CoreWorkEnqueueOutcome::Backpressured(CoreWorkQueuePressure {
+            active: 1,
+            max_active: 1,
+            backpressured: true
+        })
+    ));
+
+    let existing = db
+        .try_enqueue_core_work_for_account(
+            &account_id,
+            CoreWorkType::Analyze,
+            "first",
+            serde_json::json!({"reason": "backpressure_existing_update"}),
+            backpressure,
+        )
+        .await
+        .expect("existing active work can be refreshed");
+    assert!(matches!(existing, CoreWorkEnqueueOutcome::Enqueued(_)));
 
     cleanup_test_core_work_account(&db, &account_id).await;
 }
