@@ -7,6 +7,8 @@ use crate::config::DEFAULT_ACCOUNT_ID;
 use crate::database::rows::email_record_from_row;
 use crate::db::{Database, EmailRecord};
 
+pub const DEFAULT_ANALYSIS_LOCK_TTL_SECS: i64 = 900;
+
 /// One row for the file command: emails that have a pending recommendation different from current location.
 #[derive(Debug, Clone)]
 pub struct PendingLocationApply {
@@ -413,6 +415,11 @@ impl Database {
             WHERE account_id = $1
               AND deleted_from_server_at IS NULL
               AND (body_text IS NOT NULL OR raw_email_content IS NOT NULL)
+              AND (
+                  analysis_locked_at IS NULL
+                  OR analysis_lock_expires_at IS NULL
+                  OR analysis_lock_expires_at <= NOW()
+              )
             ORDER BY received_date DESC NULLS LAST
             LIMIT $2
             "#
@@ -437,6 +444,11 @@ impl Database {
                   OR analysis_failed_at IS NULL
                   OR analysis_failed_at < NOW() - (INTERVAL '1 minute' * POWER(2, LEAST(analysis_attempts, 6)))
               )
+              AND (
+                  analysis_locked_at IS NULL
+                  OR analysis_lock_expires_at IS NULL
+                  OR analysis_lock_expires_at <= NOW()
+              )
             ORDER BY received_date DESC NULLS LAST
             LIMIT $2
             "#
@@ -448,6 +460,234 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .context("get_unanalyzed_emails")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(email_record_from_row(&row));
+        }
+        Ok(out)
+    }
+
+    pub async fn reset_stale_analysis_claims_for_account(&self, account_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE emails
+            SET analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND analysis_locked_at IS NOT NULL
+              AND (
+                  analysis_lock_expires_at IS NULL
+                  OR analysis_lock_expires_at <= NOW()
+              )
+            "#,
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .context("reset_stale_analysis_claims")?;
+
+        let rows = result.rows_affected();
+        if rows > 0 {
+            crate::metrics::counter("analysis_claim_stale_reset_total", rows, &[]);
+            log::warn!(
+                target: "analysis_claim",
+                "{}",
+                serde_json::json!({
+                    "event": "analysis_claim_stale_reset",
+                    "account_id": account_id,
+                    "rows_affected": rows,
+                })
+            );
+        }
+        Ok(rows)
+    }
+
+    pub async fn release_analysis_claims_for_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        message_ids: &[String],
+        reason: &str,
+    ) -> Result<u64> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let rows = sqlx::query(
+            r#"
+            UPDATE emails
+            SET analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND analysis_worker_id = $2
+              AND message_id = ANY($3)
+              AND analysis_locked_at IS NOT NULL
+            RETURNING message_id
+            "#,
+        )
+        .bind(account_id)
+        .bind(worker_id)
+        .bind(message_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("release_analysis_claims")?;
+
+        if !rows.is_empty() {
+            crate::metrics::counter("analysis_claim_release_total", rows.len() as u64, &[]);
+            log::warn!(
+                target: "analysis_claim",
+                "{}",
+                serde_json::json!({
+                    "event": "analysis_claim_release",
+                    "account_id": account_id,
+                    "worker_id": worker_id,
+                    "rows_affected": rows.len(),
+                    "reason": reason,
+                })
+            );
+        }
+        Ok(rows.len() as u64)
+    }
+
+    pub async fn claim_unanalyzed_emails_for_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        limit: u32,
+    ) -> Result<Vec<EmailRecord>> {
+        self.claim_analysis_emails_for_account(
+            account_id,
+            worker_id,
+            limit,
+            false,
+            DEFAULT_ANALYSIS_LOCK_TTL_SECS,
+        )
+        .await
+    }
+
+    pub async fn claim_analysis_emails_for_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        limit: u32,
+        force: bool,
+        lock_ttl_secs: i64,
+    ) -> Result<Vec<EmailRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.reset_stale_analysis_claims_for_account(account_id)
+            .await
+            .context("reset stale analysis claims before claim")?;
+
+        let query = if force {
+            r#"
+            WITH claimable AS (
+                SELECT account_id, message_id
+                FROM emails
+                WHERE account_id = $1
+                  AND deleted_from_server_at IS NULL
+                  AND (body_text IS NOT NULL OR raw_email_content IS NOT NULL)
+                  AND (
+                      analysis_locked_at IS NULL
+                      OR analysis_lock_expires_at IS NULL
+                      OR analysis_lock_expires_at <= NOW()
+                  )
+                ORDER BY received_date DESC NULLS LAST, message_id ASC
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE emails e
+            SET analysis_locked_at = NOW(),
+                analysis_worker_id = $2,
+                analysis_lock_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                updated_at = NOW()
+            FROM claimable c
+            WHERE e.account_id = c.account_id
+              AND e.message_id = c.message_id
+            RETURNING e.message_id, e.subject, e.sender, e.received_date, e.spam_status, e.phishing_status, e.marketing_status,
+                   e.otp_status, e.otp_code, e.otp_expires, e.threat_level, e.threat_indicators, e.uid, e.uid_validity,
+                   e.ai_summary, e.human_summary, e.category, e.subcategory, e.organization, e.topic,
+                   e.location, e.location_recommendation, e.offer_expires, e.related_message_ids, e.email_type,
+                   COALESCE(e.is_read, false) as is_read, e.raw_email_content, e.body_text, e.body_synced_at,
+                   e.message_size, e.message_tokens, e.analyzed_at, e.action_status, e.action_applied_at,
+                   e.analysis_attempts, e.analysis_failed_at, e.analysis_permanent_failure, e.last_analysis_error,
+                   e.created_at, e.updated_at
+            "#
+        } else {
+            r#"
+            WITH claimable AS (
+                SELECT account_id, message_id
+                FROM emails
+                WHERE account_id = $1
+                  AND analyzed_at IS NULL
+                  AND analysis_permanent_failure = FALSE
+                  AND deleted_from_server_at IS NULL
+                  AND (body_text IS NOT NULL OR raw_email_content IS NOT NULL)
+                  AND (
+                      analysis_attempts = 0
+                      OR analysis_failed_at IS NULL
+                      OR analysis_failed_at < NOW() - (INTERVAL '1 minute' * POWER(2, LEAST(analysis_attempts, 6)))
+                  )
+                  AND (
+                      analysis_locked_at IS NULL
+                      OR analysis_lock_expires_at IS NULL
+                      OR analysis_lock_expires_at <= NOW()
+                  )
+                ORDER BY received_date DESC NULLS LAST, message_id ASC
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE emails e
+            SET analysis_locked_at = NOW(),
+                analysis_worker_id = $2,
+                analysis_lock_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                updated_at = NOW()
+            FROM claimable c
+            WHERE e.account_id = c.account_id
+              AND e.message_id = c.message_id
+            RETURNING e.message_id, e.subject, e.sender, e.received_date, e.spam_status, e.phishing_status, e.marketing_status,
+                   e.otp_status, e.otp_code, e.otp_expires, e.threat_level, e.threat_indicators, e.uid, e.uid_validity,
+                   e.ai_summary, e.human_summary, e.category, e.subcategory, e.organization, e.topic,
+                   e.location, e.location_recommendation, e.offer_expires, e.related_message_ids, e.email_type,
+                   COALESCE(e.is_read, false) as is_read, e.raw_email_content, e.body_text, e.body_synced_at,
+                   e.message_size, e.message_tokens, e.analyzed_at, e.action_status, e.action_applied_at,
+                   e.analysis_attempts, e.analysis_failed_at, e.analysis_permanent_failure, e.last_analysis_error,
+                   e.created_at, e.updated_at
+            "#
+        };
+
+        let rows = sqlx::query(query)
+            .bind(account_id)
+            .bind(worker_id)
+            .bind(limit as i64)
+            .bind(lock_ttl_secs.max(1))
+            .fetch_all(&self.pool)
+            .await
+            .context("claim_analysis_emails")?;
+
+        if !rows.is_empty() {
+            crate::metrics::counter("analysis_claim_total", rows.len() as u64, &[]);
+            log::info!(
+                target: "analysis_claim",
+                "{}",
+                serde_json::json!({
+                    "event": "analysis_claim",
+                    "account_id": account_id,
+                    "worker_id": worker_id,
+                    "limit": limit,
+                    "claimed": rows.len(),
+                    "force": force,
+                    "lock_ttl_secs": lock_ttl_secs.max(1),
+                })
+            );
+        }
 
         let mut out = Vec::new();
         for row in rows {
@@ -535,6 +775,9 @@ impl Database {
                 analysis_failed_at = NULL,
                 analysis_permanent_failure = FALSE,
                 last_analysis_error = NULL,
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
                 action_status = NULL,
                 action_applied_at = NULL,
                 updated_at = NOW()
@@ -565,6 +808,76 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("update_ai_fields")?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn update_ai_fields_for_claimed_account(
+        &self,
+        account_id: &str,
+        worker_id: &str,
+        input: &UpdateAiFieldsInput<'_>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE emails SET
+                spam_status = COALESCE($3, spam_status),
+                phishing_status = COALESCE($4, phishing_status),
+                marketing_status = COALESCE($5, marketing_status),
+                otp_status = COALESCE($6, otp_status),
+                otp_code = COALESCE($7, otp_code),
+                otp_expires = COALESCE($8, otp_expires),
+                threat_level = COALESCE($9, threat_level),
+                threat_indicators = COALESCE($10, threat_indicators),
+                ai_summary = COALESCE($11, ai_summary),
+                human_summary = COALESCE($12, human_summary),
+                category = COALESCE($13, category),
+                subcategory = COALESCE($14, subcategory),
+                organization = COALESCE($15, organization),
+                topic = COALESCE($16, topic),
+                email_type = COALESCE($17, email_type),
+                location_recommendation = COALESCE($18, location_recommendation),
+                location_create_if_missing = COALESCE($19, location_create_if_missing),
+                offer_expires = COALESCE($20, offer_expires),
+                analyzed_at = NOW(),
+                analysis_failed_at = NULL,
+                analysis_permanent_failure = FALSE,
+                last_analysis_error = NULL,
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
+                action_status = NULL,
+                action_applied_at = NULL,
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND message_id = $2
+              AND analysis_worker_id = $21
+              AND analysis_locked_at IS NOT NULL
+            "#,
+        )
+        .bind(account_id)
+        .bind(input.message_id)
+        .bind(input.spam_status)
+        .bind(input.phishing_status)
+        .bind(input.marketing_status)
+        .bind(input.otp_status)
+        .bind(input.otp_code)
+        .bind(input.otp_expires)
+        .bind(input.threat_level)
+        .bind(input.threat_indicators.cloned().map(Json::from))
+        .bind(input.ai_summary.cloned().map(Json::from))
+        .bind(input.human_summary)
+        .bind(input.category)
+        .bind(input.subcategory)
+        .bind(input.organization)
+        .bind(input.topic)
+        .bind(input.email_type)
+        .bind(input.location_recommendation)
+        .bind(input.location_create_if_missing)
+        .bind(input.offer_expires)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("update_ai_fields_for_claimed_account")?;
         Ok(result.rows_affected())
     }
 
@@ -814,6 +1127,9 @@ impl Database {
             SET analysis_attempts = analysis_attempts + 1,
                 analysis_failed_at = NOW(),
                 last_analysis_error = LEFT($3, 2000),
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
                 updated_at = NOW()
             WHERE account_id = $1
               AND message_id = $2
@@ -826,6 +1142,39 @@ impl Database {
         .await
         .context("record_analysis_attempt_failed")?;
         Ok(())
+    }
+
+    pub async fn record_analysis_attempt_failed_for_claimed_account(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        worker_id: &str,
+        error: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE emails
+            SET analysis_attempts = analysis_attempts + 1,
+                analysis_failed_at = NOW(),
+                last_analysis_error = LEFT($3, 2000),
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND message_id = $2
+              AND analysis_worker_id = $4
+              AND analysis_locked_at IS NOT NULL
+            "#,
+        )
+        .bind(account_id)
+        .bind(message_id)
+        .bind(error)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("record_analysis_attempt_failed_for_claimed_account")?;
+        Ok(result.rows_affected())
     }
 
     pub async fn mark_analysis_permanent_failure(&self, message_id: &str) -> Result<()> {
@@ -842,6 +1191,9 @@ impl Database {
             r#"
             UPDATE emails
             SET analysis_permanent_failure = TRUE,
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
                 updated_at = NOW()
             WHERE account_id = $1
               AND message_id = $2
@@ -853,6 +1205,35 @@ impl Database {
         .await
         .context("mark_analysis_permanent_failure")?;
         Ok(())
+    }
+
+    pub async fn mark_analysis_permanent_failure_for_claimed_account(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        worker_id: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE emails
+            SET analysis_permanent_failure = TRUE,
+                analysis_locked_at = NULL,
+                analysis_worker_id = NULL,
+                analysis_lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE account_id = $1
+              AND message_id = $2
+              AND analysis_worker_id = $3
+              AND analysis_locked_at IS NOT NULL
+            "#,
+        )
+        .bind(account_id)
+        .bind(message_id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("mark_analysis_permanent_failure_for_claimed_account")?;
+        Ok(result.rows_affected())
     }
 
     /// Update only location_recommendation and location_create_if_missing (for location agent result).
