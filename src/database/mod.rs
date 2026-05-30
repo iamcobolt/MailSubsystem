@@ -33,7 +33,9 @@ pub use core_work::{
     CoreWorkBackpressureConfig, CoreWorkEnqueueOutcome, CoreWorkQueueEntry, CoreWorkStatusItem,
     CoreWorkStatusSummary, CoreWorkType,
 };
-pub use email_analysis::{PendingLocationApply, UpdateAiFieldsInput};
+pub use email_analysis::{
+    PendingLocationApply, UpdateAiFieldsInput, DEFAULT_ANALYSIS_LOCK_TTL_SECS,
+};
 pub use email_queries::{DigestWindowStats, EmailListFilters};
 pub use frontier_queue::FrontierQueueEntry;
 pub use mailbox_sync::{FolderSyncResult, ImapFolder, SystemFilingMoveRecord};
